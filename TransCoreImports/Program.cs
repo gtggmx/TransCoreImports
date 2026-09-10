@@ -3,7 +3,7 @@ using System.Text;
 using System.Text.Json;
 using Microsoft.Data.SqlClient;
 
-namespace TransCoreHourlyReport;
+namespace TransCoreImports;
 
 internal static class Program
 {

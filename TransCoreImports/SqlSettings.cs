@@ -1,4 +1,4 @@
-namespace TransCoreHourlyReport;
+namespace TransCoreImports;
 
 public class SqlSettings
 {

@@ -5,8 +5,8 @@
     <TargetFramework>net9.0</TargetFramework>
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
-    <RootNamespace>TransCoreHourlyReport</RootNamespace>
-    <AssemblyName>TransCoreHourlyReport</AssemblyName>
+    <RootNamespace>TransCoreImports</RootNamespace>
+    <AssemblyName>TransCoreImports</AssemblyName>
   </PropertyGroup>
 
   <ItemGroup>
