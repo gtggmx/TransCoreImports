@@ -14,4 +14,5 @@ public class SqlSettings
 public class AppSettings
 {
     public SqlSettings Sql { get; set; } = new();
+    public SqlSettings SessionSql { get; set; } = new();
 }

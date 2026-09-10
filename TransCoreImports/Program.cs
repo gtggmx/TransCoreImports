@@ -12,77 +12,101 @@ internal static class Program
     // same loop here in C# instead.
     private static readonly int[] OrgIds = { 50, 55, 60, 65, 70, 75, 80 };
 
-    private const string ProcedureName = "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]";
     private const int MaxDaysPerCall = 7;
-    private const string DefaultOutputFolder = @"C:\Users\ggoksu\Documents\TransCore_Reporting\output";
 
-    private const string HeaderRow =
-        "Facility,LaneGroup,Date,Hour,VIOL2,VIOL3,VIOL4,VIOL5,VIOL6_9,VIOL," +
-        "ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal";
+    // Each import type has its own stored procedure and CSV column structure. Only 1310
+    // is implemented today; add new entries here as other import types are defined.
+    // Output path for every type is <-o folder>\<importType>\<year>\<MonthName>\...
+    private sealed record ImportTypeConfig(string ProcedureName, string HeaderRow);
+
+    private static readonly Dictionary<string, ImportTypeConfig> ImportTypes = new(StringComparer.OrdinalIgnoreCase)
+    {
+        ["1310"] = new ImportTypeConfig(
+            ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
+            HeaderRow: "Facility,LaneGroup,Date,Hour,VIOL2,VIOL3,VIOL4,VIOL5,VIOL6_9,VIOL," +
+                       "ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal")
+    };
 
     private static async Task<int> Main(string[] args)
     {
         try
         {
-            var (startDate, endDate, outputFolder) = ParseArguments(args);
+            var (startDate, endDate, importType, outputFolder) = ParseArguments(args);
+            var importConfig = ImportTypes[importType];
 
             var settings = LoadOrPromptSqlSettings();
-            var connectionString = BuildConnectionString(settings);
+            var connectionString = BuildConnectionString(settings.Sql);
 
-            outputFolder ??= DefaultOutputFolder;
-            Directory.CreateDirectory(outputFolder);
-            var outputPath = Path.Combine(outputFolder, OutputFileName(startDate, endDate));
+            var outputPath = BuildOutputPath(outputFolder, importType, startDate, endDate);
 
+            var sessionId = await InsertSessionStartAsync(settings.SessionSql);
+
+            Console.WriteLine($"Session ID : {sessionId}");
+            Console.WriteLine($"Import type: {importType}");
             Console.WriteLine($"Date range : {startDate:yyyy-MM-dd} .. {endDate:yyyy-MM-dd}");
             Console.WriteLine($"Output file: {Path.GetFullPath(outputPath)}");
             Console.WriteLine();
 
-            var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+            var outputFileName = Path.GetFileName(outputPath);
+            var filesProcessed = 0;
             long totalRows = 0;
-            var failures = new List<string>();
-
-            await using (var connection = new SqlConnection(connectionString))
+            try
             {
-                await connection.OpenAsync();
+                var stopwatch = System.Diagnostics.Stopwatch.StartNew();
+                var failures = new List<string>();
 
-                await using var writer = new StreamWriter(outputPath, append: false, Encoding.UTF8);
-                writer.Write(HeaderRow);
-                writer.Write("\r\n");
+                await InsertOutFileStartAsync(settings.SessionSql, sessionId, importType, outputFileName, startDate, endDate);
 
-                foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate))
+                await using (var connection = new SqlConnection(connectionString))
                 {
-                    foreach (var orgId in OrgIds)
+                    await connection.OpenAsync();
+
+                    await using var writer = new StreamWriter(outputPath, append: false, Encoding.UTF8);
+                    writer.Write(importConfig.HeaderRow);
+                    writer.Write("\r\n");
+
+                    foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate))
                     {
-                        Console.WriteLine($"OrgID {orgId,3}  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
-                        try
+                        foreach (var orgId in OrgIds)
                         {
-                            var rows = await RunOneCallAsync(connection, settings.Sql, orgId, chunkStart, chunkEnd, writer);
-                            totalRows += rows;
-                            Console.WriteLine($"    {rows} row(s)");
-                        }
-                        catch (Exception ex)
-                        {
-                            var message = $"OrgID {orgId} {chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
-                            failures.Add(message);
-                            Console.Error.WriteLine($"    FAILED: {ex.Message}");
+                            Console.WriteLine($"OrgID {orgId,3}  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
+                            try
+                            {
+                                var rows = await RunOneCallAsync(connection, settings.Sql, importConfig.ProcedureName, orgId, chunkStart, chunkEnd, writer);
+                                totalRows += rows;
+                                Console.WriteLine($"    {rows} row(s)");
+                            }
+                            catch (Exception ex)
+                            {
+                                var message = $"OrgID {orgId} {chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
+                                failures.Add(message);
+                                Console.Error.WriteLine($"    FAILED: {ex.Message}");
+                            }
                         }
                     }
                 }
+
+                filesProcessed = 1;
+                stopwatch.Stop();
+
+                Console.WriteLine();
+                Console.WriteLine($"Done. {totalRows} row(s) written in {stopwatch.Elapsed.TotalSeconds:F1} sec.");
+                if (failures.Count > 0)
+                {
+                    Console.WriteLine($"{failures.Count} call(s) failed:");
+                    foreach (var f in failures)
+                        Console.WriteLine($"  - {f}");
+                    return 1;
+                }
+
+                return 0;
             }
-
-            stopwatch.Stop();
-
-            Console.WriteLine();
-            Console.WriteLine($"Done. {totalRows} row(s) written in {stopwatch.Elapsed.TotalSeconds:F1} sec.");
-            if (failures.Count > 0)
+            finally
             {
-                Console.WriteLine($"{failures.Count} call(s) failed:");
-                foreach (var f in failures)
-                    Console.WriteLine($"  - {f}");
-                return 1;
+                var fileSize = File.Exists(outputPath) ? new FileInfo(outputPath).Length : (long?)null;
+                await UpdateOutFileEndAsync(settings.SessionSql, sessionId, outputFileName, totalRows, fileSize);
+                await UpdateSessionEndAsync(settings.SessionSql, sessionId, filesProcessed);
             }
-
-            return 0;
         }
         catch (Exception ex)
         {
@@ -94,6 +118,7 @@ internal static class Program
     private static async Task<long> RunOneCallAsync(
         SqlConnection connection,
         SqlSettings settings,
+        string procedureName,
         int orgId,
         DateTime chunkStart,
         DateTime chunkEnd,
@@ -101,7 +126,7 @@ internal static class Program
     {
         await using var command = connection.CreateCommand();
         command.CommandType = System.Data.CommandType.StoredProcedure;
-        command.CommandText = ProcedureName;
+        command.CommandText = procedureName;
         command.CommandTimeout = settings.CommandTimeoutSeconds;
 
         command.Parameters.Add(new SqlParameter("@OrgID", System.Data.SqlDbType.VarChar, 50) { Value = orgId.ToString(CultureInfo.InvariantCulture) });
@@ -242,19 +267,98 @@ internal static class Program
         }
     }
 
-    private static (DateTime StartDate, DateTime EndDate, string? OutputFolder) ParseArguments(string[] args)
+    private static (DateTime StartDate, DateTime EndDate, string ImportType, string OutputFolder) ParseArguments(string[] args)
     {
-        string? startArg = args.Length > 0 ? args[0] : null;
-        string? endArg = args.Length > 1 ? args[1] : null;
-        string? outputFolder = args.Length > 2 ? args[2] : null;
+        string? startArg = null;
+        string? endArg = null;
+        string? importTypeArg = null;
+        string? outputFolder = null;
+        var relativeRange = false;
 
-        var startDate = ParseOrPromptDate(startArg, "Start date (yyyy-MM-dd)");
-        var endDate = ParseOrPromptDate(endArg, "End date (yyyy-MM-dd)");
+        for (var i = 0; i < args.Length; i++)
+        {
+            switch (args[i])
+            {
+                case "-sd":
+                    startArg = RequireValue(args, ref i, "-sd");
+                    break;
+                case "-ed":
+                    endArg = RequireValue(args, ref i, "-ed");
+                    break;
+                case "-ra":
+                    relativeRange = true;
+                    break;
+                case "-it":
+                    importTypeArg = RequireValue(args, ref i, "-it");
+                    break;
+                case "-o":
+                    outputFolder = RequireValue(args, ref i, "-o");
+                    break;
+                default:
+                    throw new ArgumentException($"Unrecognized argument '{args[i]}'. Usage: -sd <date> -ed <date> | -ra, -it <importType> -o <folder>");
+            }
+        }
+
+        DateTime startDate, endDate;
+        if (relativeRange)
+        {
+            if (startArg is not null || endArg is not null)
+                throw new ArgumentException("-ra cannot be combined with -sd/-ed.");
+
+            var today = DateTime.Today;
+            startDate = new DateTime(today.Year, today.Month, 1);
+            endDate = today.AddDays(-1);
+        }
+        else
+        {
+            startDate = ParseOrPromptDate(startArg, "Start date (yyyy-MM-dd)");
+            endDate = ParseOrPromptDate(endArg, "End date (yyyy-MM-dd)");
+        }
 
         if (endDate < startDate)
             throw new ArgumentException("End date cannot be before start date.");
 
-        return (startDate, endDate, outputFolder);
+        var importType = ParseOrPromptImportType(importTypeArg);
+        var resolvedOutputFolder = ParseOrPromptOutputFolder(outputFolder);
+
+        return (startDate, endDate, importType, resolvedOutputFolder);
+    }
+
+    private static string ParseOrPromptOutputFolder(string? candidate)
+    {
+        while (true)
+        {
+            var input = (candidate ?? PromptFor("Output folder")).Trim();
+            candidate = null; // only reuse the command-line value once
+
+            if (!string.IsNullOrWhiteSpace(input))
+                return input;
+
+            Console.WriteLine("Output folder is required.");
+        }
+    }
+
+    private static string ParseOrPromptImportType(string? candidate)
+    {
+        var supported = string.Join(", ", ImportTypes.Keys);
+        while (true)
+        {
+            var input = (candidate ?? PromptFor($"Import type ({supported})")).Trim();
+            candidate = null; // only reuse the command-line value once
+
+            if (ImportTypes.ContainsKey(input))
+                return input;
+
+            Console.WriteLine($"Unknown import type '{input}'. Supported types: {supported}");
+        }
+    }
+
+    private static string RequireValue(string[] args, ref int i, string flag)
+    {
+        if (i + 1 >= args.Length)
+            throw new ArgumentException($"Missing value for '{flag}'.");
+
+        return args[++i];
     }
 
     private static DateTime ParseOrPromptDate(string? candidate, string prompt)
@@ -277,10 +381,21 @@ internal static class Program
         return Console.ReadLine() ?? "";
     }
 
-    private static string OutputFileName(DateTime startDate, DateTime endDate) =>
-        startDate == endDate
-            ? $"Results_{startDate:yyyyMMdd}.csv"
-            : $"Results_{startDate:yyyyMMdd}_{endDate:yyyyMMdd}.csv";
+    // <baseFolder>\<importType>\<year>\<MonthName>\Result_<importType>_<start>_<end>_<runDate>_<runTime>.csv
+    // Year/month reflect the start of the reporting interval.
+    private static string BuildOutputPath(string baseFolder, string importType, DateTime startDate, DateTime endDate)
+    {
+        var folder = Path.Combine(
+            baseFolder,
+            importType,
+            startDate.ToString("yyyy", CultureInfo.InvariantCulture),
+            startDate.ToString("MMMM", CultureInfo.InvariantCulture));
+        Directory.CreateDirectory(folder);
+
+        var now = DateTime.Now;
+        var fileName = $"Result_{importType}_{startDate:yyyyMMdd}_{endDate:yyyyMMdd}_{now:yyyyMMdd}_{now:HHmmss}.csv";
+        return Path.Combine(folder, fileName);
+    }
 
     private static AppSettings LoadOrPromptSqlSettings()
     {
@@ -364,9 +479,84 @@ internal static class Program
         return password.ToString();
     }
 
-    private static string BuildConnectionString(AppSettings settings)
+    // Logs the run to TCore_Import.dbo.Session. SessionID is generated by the table's
+    // own sequence default; we just read it back via OUTPUT.
+    private static async Task<long> InsertSessionStartAsync(SqlSettings sessionSql)
     {
-        var sql = settings.Sql;
+        await using var connection = new SqlConnection(BuildConnectionString(sessionSql));
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "INSERT INTO dbo.[Session] (SessionStart, SessionHost, SessionUser) " +
+            "OUTPUT INSERTED.SessionID " +
+            "VALUES (@SessionStart, @SessionHost, @SessionUser);";
+        command.Parameters.Add(new SqlParameter("@SessionStart", System.Data.SqlDbType.DateTime) { Value = DateTime.Now });
+        command.Parameters.Add(new SqlParameter("@SessionHost", System.Data.SqlDbType.NVarChar, 256) { Value = Environment.MachineName });
+        command.Parameters.Add(new SqlParameter("@SessionUser", System.Data.SqlDbType.NVarChar, 256) { Value = Environment.UserName });
+
+        return (long)(await command.ExecuteScalarAsync())!;
+    }
+
+    private static async Task UpdateSessionEndAsync(SqlSettings sessionSql, long sessionId, int filesProcessed)
+    {
+        await using var connection = new SqlConnection(BuildConnectionString(sessionSql));
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "UPDATE dbo.[Session] SET SessionEnd = @SessionEnd, FilesProcessed = @FilesProcessed " +
+            "WHERE SessionID = @SessionID;";
+        command.Parameters.Add(new SqlParameter("@SessionEnd", System.Data.SqlDbType.DateTime) { Value = DateTime.Now });
+        command.Parameters.Add(new SqlParameter("@FilesProcessed", System.Data.SqlDbType.Int) { Value = filesProcessed });
+        command.Parameters.Add(new SqlParameter("@SessionID", System.Data.SqlDbType.BigInt) { Value = sessionId });
+
+        await command.ExecuteNonQueryAsync();
+    }
+
+    // Logs one output file to TCore_Import.dbo.OutFiles, keyed by (SessionID, OutputFileName).
+    // id is an identity column the app never sets.
+    private static async Task InsertOutFileStartAsync(
+        SqlSettings sessionSql, long sessionId, string fileType, string outputFileName, DateTime beginDate, DateTime endDate)
+    {
+        await using var connection = new SqlConnection(BuildConnectionString(sessionSql));
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "INSERT INTO dbo.[OutFiles] (SessionID, FileType, OutputFileName, ProcessStart, BeginDate, EndDate) " +
+            "VALUES (@SessionID, @FileType, @OutputFileName, @ProcessStart, @BeginDate, @EndDate);";
+        command.Parameters.Add(new SqlParameter("@SessionID", System.Data.SqlDbType.BigInt) { Value = sessionId });
+        command.Parameters.Add(new SqlParameter("@FileType", System.Data.SqlDbType.NVarChar, 64) { Value = fileType });
+        command.Parameters.Add(new SqlParameter("@OutputFileName", System.Data.SqlDbType.NVarChar, 256) { Value = outputFileName });
+        command.Parameters.Add(new SqlParameter("@ProcessStart", System.Data.SqlDbType.DateTime2) { Value = DateTime.Now });
+        command.Parameters.Add(new SqlParameter("@BeginDate", System.Data.SqlDbType.Date) { Value = beginDate.Date });
+        command.Parameters.Add(new SqlParameter("@EndDate", System.Data.SqlDbType.Date) { Value = endDate.Date });
+
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static async Task UpdateOutFileEndAsync(
+        SqlSettings sessionSql, long sessionId, string outputFileName, long totalLines, long? fileSize)
+    {
+        await using var connection = new SqlConnection(BuildConnectionString(sessionSql));
+        await connection.OpenAsync();
+
+        await using var command = connection.CreateCommand();
+        command.CommandText =
+            "UPDATE dbo.[OutFiles] SET ProcessEnd = @ProcessEnd, FileSize = @FileSize, TotalLines = @TotalLines " +
+            "WHERE SessionID = @SessionID AND OutputFileName = @OutputFileName;";
+        command.Parameters.Add(new SqlParameter("@ProcessEnd", System.Data.SqlDbType.DateTime2) { Value = DateTime.Now });
+        command.Parameters.Add(new SqlParameter("@FileSize", System.Data.SqlDbType.BigInt) { Value = (object?)fileSize ?? DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@TotalLines", System.Data.SqlDbType.BigInt) { Value = totalLines });
+        command.Parameters.Add(new SqlParameter("@SessionID", System.Data.SqlDbType.BigInt) { Value = sessionId });
+        command.Parameters.Add(new SqlParameter("@OutputFileName", System.Data.SqlDbType.NVarChar, 256) { Value = outputFileName });
+
+        await command.ExecuteNonQueryAsync();
+    }
+
+    private static string BuildConnectionString(SqlSettings sql)
+    {
         var builder = new SqlConnectionStringBuilder
         {
             DataSource = sql.Server,
