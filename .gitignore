@@ -1,0 +1,4 @@
+bin/
+obj/
+TransCoreHourlyReport/Output/
+appsettings.local.json
