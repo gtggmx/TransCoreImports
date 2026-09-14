@@ -7,10 +7,9 @@ namespace TransCoreImports;
 
 internal static class Program
 {
-    // Distinct OrgIDs pulled from #TMP_GANTRY_CONV in 1310_Proc_Result.sql.
-    // The production script loops over these with a T-SQL cursor; we do the
-    // same loop here in C# instead.
-    private static readonly int[] OrgIds = { 50, 55, 60, 65, 70, 75, 80 };
+    // @OrgID = 0 returns every OrgName's rows in one call, so there's no need to
+    // loop over the individual OrgIDs from #TMP_GANTRY_CONV in 1310_Proc_Result.sql.
+    private const string AllOrgsId = "0";
 
     private const int MaxDaysPerCall = 7;
 
@@ -47,7 +46,7 @@ internal static class Program
         // per hour (lanes are NOT summed together here).
         ["1270"] = new ImportTypeConfig(
             ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
-            HeaderRow: "OrgName,textBox52,LaneGroupName,txtField1,txtRequiredTimeValue,SpecialEvent,txtTimeEndedValue,txtRepairTimeValue",
+            HeaderRow: "OrgName,Date,Location,Lane,SunPass,Spec Evnt,NR,Viol",
             WriteRows: Write1270Rows)
     };
 
@@ -95,8 +94,8 @@ internal static class Program
                 var failures = new List<string>();
 
                 // Group requested import types by shared procedure so each procedure is
-                // called exactly once per (chunk, OrgID), regardless of how many import
-                // types consume its result.
+                // called exactly once per chunk, regardless of how many import types
+                // consume its result. @OrgID = 0 returns every OrgName in one call.
                 var byProcedure = importTypes.GroupBy(t => t.Config.ProcedureName).ToList();
 
                 await using (var connection = new SqlConnection(connectionString))
@@ -105,28 +104,25 @@ internal static class Program
 
                     foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate))
                     {
-                        foreach (var orgId in OrgIds)
+                        foreach (var procGroup in byProcedure)
                         {
-                            foreach (var procGroup in byProcedure)
+                            var typeNames = string.Join("+", procGroup.Select(t => t.Name));
+                            Console.WriteLine($"[{typeNames}]  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
+                            try
                             {
-                                var typeNames = string.Join("+", procGroup.Select(t => t.Name));
-                                Console.WriteLine($"[{typeNames}] OrgID {orgId,3}  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
-                                try
+                                var rawRows = await FetchRawRowsAsync(connection, settings.Sql, procGroup.Key, chunkStart, chunkEnd);
+                                foreach (var (name, config) in procGroup)
                                 {
-                                    var rawRows = await FetchRawRowsAsync(connection, settings.Sql, procGroup.Key, orgId, chunkStart, chunkEnd);
-                                    foreach (var (name, config) in procGroup)
-                                    {
-                                        var count = config.WriteRows(rawRows, writers[name]);
-                                        totalRowsByType[name] += count;
-                                        Console.WriteLine($"    [{name}] {count} row(s)");
-                                    }
+                                    var count = config.WriteRows(rawRows, writers[name]);
+                                    totalRowsByType[name] += count;
+                                    Console.WriteLine($"    [{name}] {count} row(s)");
                                 }
-                                catch (Exception ex)
-                                {
-                                    var message = $"OrgID {orgId} {chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
-                                    failures.Add(message);
-                                    Console.Error.WriteLine($"    FAILED: {ex.Message}");
-                                }
+                            }
+                            catch (Exception ex)
+                            {
+                                var message = $"{chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
+                                failures.Add(message);
+                                Console.Error.WriteLine($"    FAILED: {ex.Message}");
                             }
                         }
                     }
@@ -176,7 +172,6 @@ internal static class Program
         SqlConnection connection,
         SqlSettings settings,
         string procedureName,
-        int orgId,
         DateTime chunkStart,
         DateTime chunkEnd)
     {
@@ -185,7 +180,7 @@ internal static class Program
         command.CommandText = procedureName;
         command.CommandTimeout = settings.CommandTimeoutSeconds;
 
-        command.Parameters.Add(new SqlParameter("@OrgID", System.Data.SqlDbType.VarChar, 50) { Value = orgId.ToString(CultureInfo.InvariantCulture) });
+        command.Parameters.Add(new SqlParameter("@OrgID", System.Data.SqlDbType.VarChar, 50) { Value = AllOrgsId });
         command.Parameters.Add(new SqlParameter("@StartDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
         command.Parameters.Add(new SqlParameter("@EndDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date });
         command.Parameters.Add(new SqlParameter("@inDayType", System.Data.SqlDbType.VarChar, 10) { Value = "0" });
@@ -336,18 +331,14 @@ internal static class Program
             $"Date: {key.TransDate:MM/dd/yyyy}",
             $"LaneGroup: {key.LaneGroupName}",
             $"Lane {key.LaneNumber:D2}",
-            FormatEtcStyleSum(etcSum),
+            etcSum,
             0,
-            FormatEtcStyleSum(sums[SrcNRETC]),
-            FormatEtcStyleSum(sums[SrcVIOL])
+            sums[SrcNRETC],
+            sums[SrcVIOL]
         ];
 
         WriteCsvLine(writer, fields);
     }
-
-    // Matches SQL Server's FORMAT(value,'#,###'): grouped thousands, but a zero value
-    // renders as an empty string rather than "0" (no '0' placeholder in that pattern).
-    private static string FormatEtcStyleSum(long value) => value == 0 ? "" : FormatNumber(value);
 
     private static void WriteCsvLine(StreamWriter writer, object?[] fields)
     {
