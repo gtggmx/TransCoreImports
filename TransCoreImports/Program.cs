@@ -23,8 +23,12 @@ internal static class Program
     {
         ["1310"] = new ImportTypeConfig(
             ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
-            HeaderRow: "Facility,LaneGroup,Date,Hour,VIOL2,VIOL3,VIOL4,VIOL5,VIOL6_9,VIOL," +
-                       "ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal")
+            // Matches the header row from the legacy Susan_Old_CSV export, so downstream
+            // consumers keyed on these SSRS textbox names keep working unchanged.
+            // Facility,LaneGroup,Date,Hour,VIOL2,VIOL3,VIOL4,VIOL5,VIOL6_9,VIOL,
+            // ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal
+            HeaderRow: "txtFacilityName,txtPriority,textbox82,textbox124,textbox83,textbox85,textbox86,textbox87,textbox88,textbox89," +
+                       "textbox248,textbox63,textbox70,textbox71,textbox72,textbox73,textbox74,textbox75,textbox142,textbox183,textbox168,textbox213")
     };
 
     private static async Task<int> Main(string[] args)

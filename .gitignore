@@ -1,4 +1,6 @@
 bin/
 obj/
+.vs/
 TransCoreImports/Output/
+TransCoreImports/tempout/
 appsettings.local.json
