@@ -14,10 +14,22 @@ internal static class Program
 
     private const int MaxDaysPerCall = 7;
 
-    // Each import type has its own stored procedure and CSV column structure. Only 1310
-    // is implemented today; add new entries here as other import types are defined.
-    // Output path for every type is <-o folder>\<importType>\<year>\<MonthName>\...
-    private sealed record ImportTypeConfig(string ProcedureName, string HeaderRow);
+    // Raw per-lane-per-hour row as returned by the stored procedure (matches
+    // #TMP_EXECRESULT in 1310_Proc_Result.sql). Every import type that shares a
+    // procedure aggregates this same row list its own way, so the procedure is
+    // only ever called once per (chunk, OrgID) no matter how many import types
+    // are requested in one run.
+    private sealed record RawRow(
+        string OrgName, string LaneGroupName, int LaneNumber, DateTime TransDate, int TransHour,
+        DateTime TollDay, int LaneGroupId, long[] Measures);
+
+    // Each import type has its own CSV column structure and aggregation, but types
+    // that share a ProcedureName reuse one fetch of the raw rows. WriteRows groups
+    // the raw rows its own way, writes them to the file, and returns the row count.
+    private sealed record ImportTypeConfig(
+        string ProcedureName,
+        string HeaderRow,
+        Func<IReadOnlyList<RawRow>, StreamWriter, long> WriteRows);
 
     private static readonly Dictionary<string, ImportTypeConfig> ImportTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -28,73 +40,110 @@ internal static class Program
             // Facility,LaneGroup,Date,Hour,VIOL2,VIOL3,VIOL4,VIOL5,VIOL6_9,VIOL,
             // ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal
             HeaderRow: "txtFacilityName,txtPriority,textbox82,textbox124,textbox83,textbox85,textbox86,textbox87,textbox88,textbox89," +
-                       "textbox248,textbox63,textbox70,textbox71,textbox72,textbox73,textbox74,textbox75,textbox142,textbox183,textbox168,textbox213")
+                       "textbox248,textbox63,textbox70,textbox71,textbox72,textbox73,textbox74,textbox75,textbox142,textbox183,textbox168,textbox213",
+            WriteRows: Write1310Rows),
+
+        // Same source rows as 1310, aggregated per lane per day instead of per gantry
+        // per hour (lanes are NOT summed together here).
+        ["1270"] = new ImportTypeConfig(
+            ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
+            HeaderRow: "OrgName,textBox52,LaneGroupName,txtField1,txtRequiredTimeValue,SpecialEvent,txtTimeEndedValue,txtRepairTimeValue",
+            WriteRows: Write1270Rows)
     };
 
     private static async Task<int> Main(string[] args)
     {
         try
         {
-            var (startDate, endDate, importType, outputFolder) = ParseArguments(args);
-            var importConfig = ImportTypes[importType];
+            var (startDate, endDate, importTypeNames, outputFolder) = ParseArguments(args);
+            var importTypes = importTypeNames.Select(t => (Name: t, Config: ImportTypes[t])).ToList();
 
             var settings = LoadOrPromptSqlSettings();
             var connectionString = BuildConnectionString(settings.Sql);
 
-            var outputPath = BuildOutputPath(outputFolder, importType, startDate, endDate);
-
             var sessionId = await InsertSessionStartAsync(settings.SessionSql);
 
             Console.WriteLine($"Session ID : {sessionId}");
-            Console.WriteLine($"Import type: {importType}");
+            Console.WriteLine($"Import type(s): {string.Join(", ", importTypeNames)}");
             Console.WriteLine($"Date range : {startDate:yyyy-MM-dd} .. {endDate:yyyy-MM-dd}");
-            Console.WriteLine($"Output file: {Path.GetFullPath(outputPath)}");
+
+            var runNow = DateTime.Now;
+            var outputPaths = new Dictionary<string, string>();
+            var writers = new Dictionary<string, StreamWriter>();
+            var totalRowsByType = new Dictionary<string, long>();
+
+            foreach (var (name, config) in importTypes)
+            {
+                var outputPath = BuildOutputPath(outputFolder, name, startDate, endDate, runNow);
+                outputPaths[name] = outputPath;
+                totalRowsByType[name] = 0;
+
+                var writer = new StreamWriter(outputPath, append: false, Encoding.UTF8);
+                writer.Write(config.HeaderRow);
+                writer.Write("\r\n");
+                writers[name] = writer;
+
+                Console.WriteLine($"Output file [{name}]: {Path.GetFullPath(outputPath)}");
+                await InsertOutFileStartAsync(settings.SessionSql, sessionId, name, Path.GetFileName(outputPath), startDate, endDate);
+            }
             Console.WriteLine();
 
-            var outputFileName = Path.GetFileName(outputPath);
             var filesProcessed = 0;
-            long totalRows = 0;
             try
             {
                 var stopwatch = System.Diagnostics.Stopwatch.StartNew();
                 var failures = new List<string>();
 
-                await InsertOutFileStartAsync(settings.SessionSql, sessionId, importType, outputFileName, startDate, endDate);
+                // Group requested import types by shared procedure so each procedure is
+                // called exactly once per (chunk, OrgID), regardless of how many import
+                // types consume its result.
+                var byProcedure = importTypes.GroupBy(t => t.Config.ProcedureName).ToList();
 
                 await using (var connection = new SqlConnection(connectionString))
                 {
                     await connection.OpenAsync();
 
-                    await using var writer = new StreamWriter(outputPath, append: false, Encoding.UTF8);
-                    writer.Write(importConfig.HeaderRow);
-                    writer.Write("\r\n");
-
                     foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate))
                     {
                         foreach (var orgId in OrgIds)
                         {
-                            Console.WriteLine($"OrgID {orgId,3}  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
-                            try
+                            foreach (var procGroup in byProcedure)
                             {
-                                var rows = await RunOneCallAsync(connection, settings.Sql, importConfig.ProcedureName, orgId, chunkStart, chunkEnd, writer);
-                                totalRows += rows;
-                                Console.WriteLine($"    {rows} row(s)");
-                            }
-                            catch (Exception ex)
-                            {
-                                var message = $"OrgID {orgId} {chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
-                                failures.Add(message);
-                                Console.Error.WriteLine($"    FAILED: {ex.Message}");
+                                var typeNames = string.Join("+", procGroup.Select(t => t.Name));
+                                Console.WriteLine($"[{typeNames}] OrgID {orgId,3}  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
+                                try
+                                {
+                                    var rawRows = await FetchRawRowsAsync(connection, settings.Sql, procGroup.Key, orgId, chunkStart, chunkEnd);
+                                    foreach (var (name, config) in procGroup)
+                                    {
+                                        var count = config.WriteRows(rawRows, writers[name]);
+                                        totalRowsByType[name] += count;
+                                        Console.WriteLine($"    [{name}] {count} row(s)");
+                                    }
+                                }
+                                catch (Exception ex)
+                                {
+                                    var message = $"OrgID {orgId} {chunkStart:yyyy-MM-dd}..{chunkEnd:yyyy-MM-dd}: {ex.Message}";
+                                    failures.Add(message);
+                                    Console.Error.WriteLine($"    FAILED: {ex.Message}");
+                                }
                             }
                         }
                     }
                 }
 
-                filesProcessed = 1;
+                foreach (var writer in writers.Values)
+                    await writer.DisposeAsync();
+
+                filesProcessed = importTypes.Count;
                 stopwatch.Stop();
 
                 Console.WriteLine();
+                var totalRows = totalRowsByType.Values.Sum();
                 Console.WriteLine($"Done. {totalRows} row(s) written in {stopwatch.Elapsed.TotalSeconds:F1} sec.");
+                foreach (var (name, _) in importTypes)
+                    Console.WriteLine($"  [{name}] {totalRowsByType[name]} row(s) -> {outputPaths[name]}");
+
                 if (failures.Count > 0)
                 {
                     Console.WriteLine($"{failures.Count} call(s) failed:");
@@ -107,8 +156,12 @@ internal static class Program
             }
             finally
             {
-                var fileSize = File.Exists(outputPath) ? new FileInfo(outputPath).Length : (long?)null;
-                await UpdateOutFileEndAsync(settings.SessionSql, sessionId, outputFileName, totalRows, fileSize);
+                foreach (var (name, _) in importTypes)
+                {
+                    var outputPath = outputPaths[name];
+                    var fileSize = File.Exists(outputPath) ? new FileInfo(outputPath).Length : (long?)null;
+                    await UpdateOutFileEndAsync(settings.SessionSql, sessionId, Path.GetFileName(outputPath), totalRowsByType[name], fileSize);
+                }
                 await UpdateSessionEndAsync(settings.SessionSql, sessionId, filesProcessed);
             }
         }
@@ -119,14 +172,13 @@ internal static class Program
         }
     }
 
-    private static async Task<long> RunOneCallAsync(
+    private static async Task<List<RawRow>> FetchRawRowsAsync(
         SqlConnection connection,
         SqlSettings settings,
         string procedureName,
         int orgId,
         DateTime chunkStart,
-        DateTime chunkEnd,
-        StreamWriter writer)
+        DateTime chunkEnd)
     {
         await using var command = connection.CreateCommand();
         command.CommandType = System.Data.CommandType.StoredProcedure;
@@ -142,45 +194,31 @@ internal static class Program
         // Source column layout matches #TMP_EXECRESULT in 1310_Proc_Result.sql:
         // 0 OrgName, 1 LaneNumber, 2 LaneGroupName, 3 TransDate, 4 TransHour,
         // 5..23 the 19 numeric measures, 24 TollDay, 25 LaneGroupID.
-        var groups = new Dictionary<GantryHourKey, long[]>();
+        var rows = new List<RawRow>();
 
         await using var reader = await command.ExecuteReaderAsync();
         do
         {
             while (await reader.ReadAsync())
             {
-                var orgName = reader.GetString(0);
-                var laneGroupName = reader.GetString(2);
-                var transDate = reader.GetDateTime(3).Date;
-                var transHour = reader.GetInt32(4);
-                var tollDay = reader.GetDateTime(24);
-                var laneGroupId = reader.GetInt32(25);
-
-                var key = new GantryHourKey(orgName, laneGroupName, transDate, transHour, tollDay, laneGroupId);
-                if (!groups.TryGetValue(key, out var sums))
-                {
-                    sums = new long[MeasureColumnCount];
-                    groups[key] = sums;
-                }
-
+                var measures = new long[MeasureColumnCount];
                 for (var m = 0; m < MeasureColumnCount; m++)
-                    sums[m] += reader.IsDBNull(SourceFirstMeasureColumn + m) ? 0 : Convert.ToInt64(reader.GetValue(SourceFirstMeasureColumn + m), CultureInfo.InvariantCulture);
+                    measures[m] = reader.IsDBNull(SourceFirstMeasureColumn + m) ? 0 : Convert.ToInt64(reader.GetValue(SourceFirstMeasureColumn + m), CultureInfo.InvariantCulture);
+
+                rows.Add(new RawRow(
+                    OrgName: reader.GetString(0),
+                    LaneGroupName: reader.GetString(2),
+                    LaneNumber: reader.GetInt32(1),
+                    TransDate: reader.GetDateTime(3).Date,
+                    TransHour: reader.GetInt32(4),
+                    TollDay: reader.GetDateTime(24),
+                    LaneGroupId: reader.GetInt32(25),
+                    Measures: measures));
             }
         }
         while (await reader.NextResultAsync());
 
-        // TransHour is no longer printed, so write rows out in a stable,
-        // deterministic order (Dictionary enumeration order is not guaranteed).
-        foreach (var pair in groups
-            .OrderBy(p => p.Key.OrgName, StringComparer.Ordinal)
-            .ThenBy(p => p.Key.LaneGroupName, StringComparer.Ordinal)
-            .ThenBy(p => p.Key.TransDate)
-            .ThenBy(p => p.Key.TransHour))
-        {
-            WriteCsvRow(writer, pair.Key, pair.Value);
-        }
-
-        return groups.Count;
+        return rows;
     }
 
     private const int SourceFirstMeasureColumn = 5; // index into the SP's result set (still has LaneNumber at 1)
@@ -189,17 +227,50 @@ internal static class Program
     // Measures, in source order: 0 VIOL2, 1 VIOL3, 2 VIOL4, 3 VIOL5, 4 VIOL6_9, 5 VIOL,
     // 6 VIOLIndAxles, 7 VIOLIVISAxles, 8 AR, 9 CardNonRev, 10 PassNR, 11 ETC2, 12 ETC3,
     // 13 ETC4, 14 ETC5, 15 ETC6_9, 16 NRETC, 17 ETCIndAxles, 18 ETCIVISAxles.
+    private const int SrcVIOL = 5;
     private const int SrcAR = 8, SrcCardNonRev = 9, SrcPassNR = 10;
     private const int SrcETC2 = 11, SrcETC3 = 12, SrcETC4 = 13, SrcETC5 = 14, SrcETC6_9 = 15;
     private const int SrcNRETC = 16;
 
+    // ---- 1310: gantry + hour, lanes summed together ----
+
     private sealed record GantryHourKey(string OrgName, string LaneGroupName, DateTime TransDate, int TransHour, DateTime TollDay, int LaneGroupId);
 
-    private static void WriteCsvRow(StreamWriter writer, GantryHourKey key, long[] sums)
+    private static long Write1310Rows(IReadOnlyList<RawRow> rows, StreamWriter writer)
+    {
+        var groups = new Dictionary<GantryHourKey, long[]>();
+        foreach (var row in rows)
+        {
+            var key = new GantryHourKey(row.OrgName, row.LaneGroupName, row.TransDate, row.TransHour, row.TollDay, row.LaneGroupId);
+            if (!groups.TryGetValue(key, out var sums))
+            {
+                sums = new long[MeasureColumnCount];
+                groups[key] = sums;
+            }
+
+            for (var m = 0; m < MeasureColumnCount; m++)
+                sums[m] += row.Measures[m];
+        }
+
+        // Hour is no longer printed, so write rows out in a stable, deterministic
+        // order (Dictionary enumeration order is not guaranteed).
+        foreach (var pair in groups
+            .OrderBy(p => p.Key.OrgName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.LaneGroupName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.TransDate)
+            .ThenBy(p => p.Key.TransHour))
+        {
+            Write1310Row(writer, pair.Key, pair.Value);
+        }
+
+        return groups.Count;
+    }
+
+    private static void Write1310Row(StreamWriter writer, GantryHourKey key, long[] sums)
     {
         var etcSum = sums[SrcETC2] + sums[SrcETC3] + sums[SrcETC4] + sums[SrcETC5] + sums[SrcETC6_9]; // P
         var nrTotal = sums[SrcAR] + sums[SrcCardNonRev] + sums[SrcPassNR] + sums[SrcNRETC]; // U: NR_TOTAL = Q+R+S+T
-        var grandTotal = sums[5] + etcSum + nrTotal; // V: J (VIOL) + P + U
+        var grandTotal = sums[SrcVIOL] + etcSum + nrTotal; // V: J (VIOL) + P + U
 
         // VIOLIndAxles/VIOLIVISAxles and ETCIndAxles/ETCIVISAxles (old columns K/L, V/W)
         // and TollDay/LaneGroupID (X/Y) are dropped. The ETC2..ETC6_9 sum sits right
@@ -211,7 +282,7 @@ internal static class Program
             $"Lane Group: {key.LaneGroupName}",
             $"Date: {key.TransDate:MM/dd/yyyy}",
             $"{key.TransHour:D2}:00",
-            sums[0], sums[1], sums[2], sums[3], sums[4], sums[5], // VIOL2, VIOL3, VIOL4, VIOL5, VIOL6_9, VIOL
+            sums[0], sums[1], sums[2], sums[3], sums[4], sums[SrcVIOL], // VIOL2, VIOL3, VIOL4, VIOL5, VIOL6_9, VIOL
             sums[SrcETC2], sums[SrcETC3], sums[SrcETC4], sums[SrcETC5], sums[SrcETC6_9],
             etcSum,
             sums[SrcAR], sums[SrcCardNonRev], sums[SrcPassNR],
@@ -220,6 +291,66 @@ internal static class Program
             grandTotal
         ];
 
+        WriteCsvLine(writer, fields);
+    }
+
+    // ---- 1270: lane + day, hours summed together, lanes kept separate ----
+
+    private sealed record LaneDayKey(string OrgName, string LaneGroupName, DateTime TransDate, int LaneNumber);
+
+    private static long Write1270Rows(IReadOnlyList<RawRow> rows, StreamWriter writer)
+    {
+        var groups = new Dictionary<LaneDayKey, long[]>();
+        foreach (var row in rows)
+        {
+            var key = new LaneDayKey(row.OrgName, row.LaneGroupName, row.TransDate, row.LaneNumber);
+            if (!groups.TryGetValue(key, out var sums))
+            {
+                sums = new long[MeasureColumnCount];
+                groups[key] = sums;
+            }
+
+            for (var m = 0; m < MeasureColumnCount; m++)
+                sums[m] += row.Measures[m];
+        }
+
+        foreach (var pair in groups
+            .OrderBy(p => p.Key.OrgName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.LaneGroupName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.TransDate)
+            .ThenBy(p => p.Key.LaneNumber))
+        {
+            Write1270Row(writer, pair.Key, pair.Value);
+        }
+
+        return groups.Count;
+    }
+
+    private static void Write1270Row(StreamWriter writer, LaneDayKey key, long[] sums)
+    {
+        var etcSum = sums[SrcETC2] + sums[SrcETC3] + sums[SrcETC4] + sums[SrcETC5] + sums[SrcETC6_9];
+
+        object?[] fields =
+        [
+            $"Plaza: {key.OrgName}",
+            $"Date: {key.TransDate:MM/dd/yyyy}",
+            $"LaneGroup: {key.LaneGroupName}",
+            $"Lane {key.LaneNumber:D2}",
+            FormatEtcStyleSum(etcSum),
+            0,
+            FormatEtcStyleSum(sums[SrcNRETC]),
+            FormatEtcStyleSum(sums[SrcVIOL])
+        ];
+
+        WriteCsvLine(writer, fields);
+    }
+
+    // Matches SQL Server's FORMAT(value,'#,###'): grouped thousands, but a zero value
+    // renders as an empty string rather than "0" (no '0' placeholder in that pattern).
+    private static string FormatEtcStyleSum(long value) => value == 0 ? "" : FormatNumber(value);
+
+    private static void WriteCsvLine(StreamWriter writer, object?[] fields)
+    {
         for (var i = 0; i < fields.Length; i++)
         {
             if (i > 0)
@@ -271,7 +402,7 @@ internal static class Program
         }
     }
 
-    private static (DateTime StartDate, DateTime EndDate, string ImportType, string OutputFolder) ParseArguments(string[] args)
+    private static (DateTime StartDate, DateTime EndDate, List<string> ImportTypes, string OutputFolder) ParseArguments(string[] args)
     {
         string? startArg = null;
         string? endArg = null;
@@ -299,7 +430,7 @@ internal static class Program
                     outputFolder = RequireValue(args, ref i, "-o");
                     break;
                 default:
-                    throw new ArgumentException($"Unrecognized argument '{args[i]}'. Usage: -sd <date> -ed <date> | -ra, -it <importType> -o <folder>");
+                    throw new ArgumentException($"Unrecognized argument '{args[i]}'. Usage: -sd <date> -ed <date> | -ra, -it <importType>[,<importType>...] -o <folder>");
             }
         }
 
@@ -322,10 +453,10 @@ internal static class Program
         if (endDate < startDate)
             throw new ArgumentException("End date cannot be before start date.");
 
-        var importType = ParseOrPromptImportType(importTypeArg);
+        var importTypes = ParseOrPromptImportTypes(importTypeArg);
         var resolvedOutputFolder = ParseOrPromptOutputFolder(outputFolder);
 
-        return (startDate, endDate, importType, resolvedOutputFolder);
+        return (startDate, endDate, importTypes, resolvedOutputFolder);
     }
 
     private static string ParseOrPromptOutputFolder(string? candidate)
@@ -342,18 +473,31 @@ internal static class Program
         }
     }
 
-    private static string ParseOrPromptImportType(string? candidate)
+    // Accepts one or more import types separated by commas, e.g. "-it 1310,1270",
+    // so types that share a stored procedure only trigger it once per call.
+    private static List<string> ParseOrPromptImportTypes(string? candidate)
     {
         var supported = string.Join(", ", ImportTypes.Keys);
         while (true)
         {
-            var input = (candidate ?? PromptFor($"Import type ({supported})")).Trim();
+            var input = candidate ?? PromptFor($"Import type(s), comma-separated ({supported})");
             candidate = null; // only reuse the command-line value once
 
-            if (ImportTypes.ContainsKey(input))
-                return input;
+            var requested = input.Split(',', StringSplitOptions.RemoveEmptyEntries | StringSplitOptions.TrimEntries);
+            if (requested.Length == 0)
+            {
+                Console.WriteLine("At least one import type is required.");
+                continue;
+            }
 
-            Console.WriteLine($"Unknown import type '{input}'. Supported types: {supported}");
+            var unknown = requested.Where(t => !ImportTypes.ContainsKey(t)).ToList();
+            if (unknown.Count > 0)
+            {
+                Console.WriteLine($"Unknown import type(s): {string.Join(", ", unknown)}. Supported types: {supported}");
+                continue;
+            }
+
+            return requested.Distinct(StringComparer.OrdinalIgnoreCase).ToList();
         }
     }
 
@@ -386,8 +530,9 @@ internal static class Program
     }
 
     // <baseFolder>\<importType>\<year>\<MonthName>\Result_<importType>_<start>_<end>_<runDate>_<runTime>.csv
-    // Year/month reflect the start of the reporting interval.
-    private static string BuildOutputPath(string baseFolder, string importType, DateTime startDate, DateTime endDate)
+    // Year/month reflect the start of the reporting interval. `now` is captured once
+    // per run so every import type's file gets the same run timestamp.
+    private static string BuildOutputPath(string baseFolder, string importType, DateTime startDate, DateTime endDate, DateTime now)
     {
         var folder = Path.Combine(
             baseFolder,
@@ -396,7 +541,6 @@ internal static class Program
             startDate.ToString("MMMM", CultureInfo.InvariantCulture));
         Directory.CreateDirectory(folder);
 
-        var now = DateTime.Now;
         var fileName = $"Result_{importType}_{startDate:yyyyMMdd}_{endDate:yyyyMMdd}_{now:yyyyMMdd}_{now:HHmmss}.csv";
         return Path.Combine(folder, fileName);
     }
