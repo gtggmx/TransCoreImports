@@ -22,13 +22,23 @@ internal static class Program
         string OrgName, string LaneGroupName, int LaneNumber, DateTime TransDate, int TransHour,
         DateTime TollDay, int LaneGroupId, long[] Measures);
 
+    // Raw row as returned by [dbo].[uspr_aud_PlazaRevenue_sql] (only the columns
+    // 2725 actually needs).
+    private sealed record RevenueRow(string LaneGroupName, decimal ExpectedRevenue, decimal Isf, DateTime DateDropped);
+
+    // Raw row as returned by [RPrl].[uspr_trn_Leakage] (matches #TMP_2552 in 2552_test.sql).
+    private sealed record LeakageRow(long OrgId, string OrgName, int LaneNumber, DateTime TransDate, double[] Measures);
+
     // Each import type has its own CSV column structure and aggregation, but types
-    // that share a ProcedureName reuse one fetch of the raw rows. WriteRows groups
-    // the raw rows its own way, writes them to the file, and returns the row count.
+    // that share a ProcedureName reuse one fetch of the raw rows (Fetch), boxed as
+    // object since different procedures return different row shapes. WriteRows
+    // casts back to the shape its own Fetch produces, writes the rows, and returns
+    // the row count.
     private sealed record ImportTypeConfig(
         string ProcedureName,
         string HeaderRow,
-        Func<IReadOnlyList<RawRow>, StreamWriter, long> WriteRows);
+        Func<SqlConnection, SqlSettings, string, DateTime, DateTime, Task<object>> Fetch,
+        Func<object, StreamWriter, long> WriteRows);
 
     private static readonly Dictionary<string, ImportTypeConfig> ImportTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -40,6 +50,7 @@ internal static class Program
             // ETC2,ETC3,ETC4,ETC5,ETC6_9,ETC_Sum,AR,CardNonRev,PassNR,NRETC,NR_TOTAL,GrandTotal
             HeaderRow: "txtFacilityName,txtPriority,textbox82,textbox124,textbox83,textbox85,textbox86,textbox87,textbox88,textbox89," +
                        "textbox248,textbox63,textbox70,textbox71,textbox72,textbox73,textbox74,textbox75,textbox142,textbox183,textbox168,textbox213",
+            Fetch: FetchTrafficRowsAsync,
             WriteRows: Write1310Rows),
 
         // Same source rows as 1310, aggregated per lane per day instead of per gantry
@@ -47,7 +58,31 @@ internal static class Program
         ["1270"] = new ImportTypeConfig(
             ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
             HeaderRow: "OrgName,Date,Location,Lane,SunPass,Spec Evnt,NR,Viol",
-            WriteRows: Write1270Rows)
+            Fetch: FetchTrafficRowsAsync,
+            WriteRows: Write1270Rows),
+
+        // Straight passthrough of [dbo].[uspr_aud_PlazaRevenue_sql]: one row per
+        // gantry, no aggregation.
+        ["2725"] = new ImportTypeConfig(
+            ProcedureName: "[dbo].[uspr_aud_PlazaRevenue_sql]",
+            HeaderRow: "textBox35,textBox51,textBox61,textBox62",
+            Fetch: FetchRevenueRowsAsync,
+            WriteRows: Write2725Rows),
+
+        // Grouped by OrgID/OrgName/LaneNumber/TransDate, summing every measure
+        // column except ExecutionID -- matches the aggregation query already
+        // drafted in 2552_test.sql. Columns A-Z match the "09-01-26 Leakage
+        // Report 2552.csv" legacy layout: B-J are literal caption text repeated
+        // on every row, W/Z both carry InProcess, X is a literal 0, and
+        // Amendment is unused.
+        ["2552"] = new ImportTypeConfig(
+            ProcedureName: "[RPrl].[uspr_trn_Leakage]",
+            HeaderRow: "OrgName,Sent To IPS,Rejected,Awaiting Response,Returned From IPS,Uncollectable Non-System," +
+                       "Uncollectable System,Flushed,No Image,In Process,LaneNumber,SentToIPS,Rejected,Outstanding," +
+                       "ReceivedFromIPS,Collectable,UncollectableNonSystem,UncollectableNonSystemAmount,UncollectableSystem," +
+                       "UncollectableSystemAmount,Flush,NoImage,InProcess,Zero,IPS,InProcess",
+            Fetch: FetchLeakageRowsAsync,
+            WriteRows: Write2552Rows)
     };
 
     private static async Task<int> Main(string[] args)
@@ -110,7 +145,8 @@ internal static class Program
                             Console.WriteLine($"[{typeNames}]  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
                             try
                             {
-                                var rawRows = await FetchRawRowsAsync(connection, settings.Sql, procGroup.Key, chunkStart, chunkEnd);
+                                var fetch = procGroup.First().Config.Fetch;
+                                var rawRows = await fetch(connection, settings.Sql, procGroup.Key, chunkStart, chunkEnd);
                                 foreach (var (name, config) in procGroup)
                                 {
                                     var count = config.WriteRows(rawRows, writers[name]);
@@ -168,7 +204,7 @@ internal static class Program
         }
     }
 
-    private static async Task<List<RawRow>> FetchRawRowsAsync(
+    private static async Task<object> FetchTrafficRowsAsync(
         SqlConnection connection,
         SqlSettings settings,
         string procedureName,
@@ -231,8 +267,9 @@ internal static class Program
 
     private sealed record GantryHourKey(string OrgName, string LaneGroupName, DateTime TransDate, int TransHour, DateTime TollDay, int LaneGroupId);
 
-    private static long Write1310Rows(IReadOnlyList<RawRow> rows, StreamWriter writer)
+    private static long Write1310Rows(object rowsObj, StreamWriter writer)
     {
+        var rows = (IReadOnlyList<RawRow>)rowsObj;
         var groups = new Dictionary<GantryHourKey, long[]>();
         foreach (var row in rows)
         {
@@ -293,8 +330,9 @@ internal static class Program
 
     private sealed record LaneDayKey(string OrgName, string LaneGroupName, DateTime TransDate, int LaneNumber);
 
-    private static long Write1270Rows(IReadOnlyList<RawRow> rows, StreamWriter writer)
+    private static long Write1270Rows(object rowsObj, StreamWriter writer)
     {
+        var rows = (IReadOnlyList<RawRow>)rowsObj;
         var groups = new Dictionary<LaneDayKey, long[]>();
         foreach (var row in rows)
         {
@@ -335,6 +373,199 @@ internal static class Program
             0,
             sums[SrcNRETC],
             sums[SrcVIOL]
+        ];
+
+        WriteCsvLine(writer, fields);
+    }
+
+    // ---- 2725: straight passthrough of [dbo].[uspr_aud_PlazaRevenue_sql] ----
+
+    private static async Task<object> FetchRevenueRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.StoredProcedure;
+        command.CommandText = procedureName;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        command.Parameters.Add(new SqlParameter("@OrgID", System.Data.SqlDbType.VarChar, 50) { Value = AllOrgsId });
+        command.Parameters.Add(new SqlParameter("@StartDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@EndDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date });
+
+        var rows = new List<RevenueRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var laneGroupNameOrdinal = reader.GetOrdinal("LaneGroupName");
+            var expectedRevenueOrdinal = reader.GetOrdinal("ExpectedRevenue");
+            var isfOrdinal = reader.GetOrdinal("ISF");
+            var dateDroppedOrdinal = reader.GetOrdinal("DateDropped");
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new RevenueRow(
+                    LaneGroupName: reader.GetString(laneGroupNameOrdinal),
+                    ExpectedRevenue: reader.IsDBNull(expectedRevenueOrdinal) ? 0m : reader.GetDecimal(expectedRevenueOrdinal),
+                    Isf: reader.IsDBNull(isfOrdinal) ? 0m : reader.GetDecimal(isfOrdinal),
+                    DateDropped: reader.GetDateTime(dateDroppedOrdinal)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write2725Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<RevenueRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            object?[] fields =
+            [
+                row.LaneGroupName,
+                FormatCurrency(row.ExpectedRevenue),
+                FormatCurrency(row.Isf),
+                $"{row.DateDropped:MM/dd/yyyy}"
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    private static string FormatCurrency(decimal value) => value.ToString("#,##0.00", CultureInfo.InvariantCulture);
+
+    // ---- 2552: [RPrl].[uspr_trn_Leakage], grouped by OrgID/OrgName/LaneNumber/TransDate ----
+
+    // Measures, in #TMP_2552 column order (ExecutionID excluded):
+    private const int SrcSentToIPS = 0, SrcOutstanding = 1, SrcReceivedFromIPS = 2, SrcUncollectableNonSystem = 3;
+    private const int SrcUncollectableNonSystemAmount = 4, SrcUncollectableSystem = 5, SrcUncollectableSystemAmount = 6;
+    private const int SrcCollectable = 7, SrcIPSRejected = 8, SrcAmendment = 9, SrcFlush = 10, SrcNoImage = 11, SrcIPS = 12, SrcInProcess = 13;
+    private const int LeakageMeasureCount = 14;
+
+    private static async Task<object> FetchLeakageRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.StoredProcedure;
+        command.CommandText = procedureName;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        command.Parameters.Add(new SqlParameter("@inOrgID", System.Data.SqlDbType.Int) { Value = 0 });
+        command.Parameters.Add(new SqlParameter("@inStartDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@inEndDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date });
+        command.Parameters.Add(new SqlParameter("@inLaneGroupID", System.Data.SqlDbType.VarChar, 10) { Value = "0" });
+
+        var rows = new List<LeakageRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var orgIdOrdinal = reader.GetOrdinal("OrgID");
+            var orgNameOrdinal = reader.GetOrdinal("OrgName");
+            var laneNumberOrdinal = reader.GetOrdinal("LaneNumber");
+            var transDateOrdinal = reader.GetOrdinal("TransDate");
+            var measureOrdinals = new[]
+            {
+                reader.GetOrdinal("SentToIPS"), reader.GetOrdinal("Outstanding"), reader.GetOrdinal("ReceivedFromIPS"),
+                reader.GetOrdinal("UncollectableNonSystem"), reader.GetOrdinal("UncollectableNonSystemAmount"),
+                reader.GetOrdinal("UncollectableSystem"), reader.GetOrdinal("UncollectableSystemAmount"),
+                reader.GetOrdinal("Collectable"), reader.GetOrdinal("IPSRejected"), reader.GetOrdinal("Amendment"),
+                reader.GetOrdinal("Flush"), reader.GetOrdinal("NoImage"), reader.GetOrdinal("IPS"), reader.GetOrdinal("InProcess")
+            };
+
+            while (await reader.ReadAsync())
+            {
+                var measures = new double[LeakageMeasureCount];
+                for (var m = 0; m < LeakageMeasureCount; m++)
+                    measures[m] = reader.IsDBNull(measureOrdinals[m]) ? 0 : Convert.ToDouble(reader.GetValue(measureOrdinals[m]), CultureInfo.InvariantCulture);
+
+                rows.Add(new LeakageRow(
+                    OrgId: Convert.ToInt64(reader.GetValue(orgIdOrdinal), CultureInfo.InvariantCulture),
+                    OrgName: reader.GetString(orgNameOrdinal),
+                    LaneNumber: reader.GetInt32(laneNumberOrdinal),
+                    TransDate: reader.GetDateTime(transDateOrdinal).Date,
+                    Measures: measures));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private sealed record LeakageKey(long OrgId, string OrgName, int LaneNumber, DateTime TransDate);
+
+    private static long Write2552Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<LeakageRow>)rowsObj;
+        var groups = new Dictionary<LeakageKey, double[]>();
+        foreach (var row in rows)
+        {
+            var key = new LeakageKey(row.OrgId, row.OrgName, row.LaneNumber, row.TransDate);
+            if (!groups.TryGetValue(key, out var sums))
+            {
+                sums = new double[LeakageMeasureCount];
+                groups[key] = sums;
+            }
+
+            for (var m = 0; m < LeakageMeasureCount; m++)
+                sums[m] += row.Measures[m];
+        }
+
+        foreach (var pair in groups
+            .OrderBy(p => p.Key.OrgId)
+            .ThenBy(p => p.Key.LaneNumber)
+            .ThenBy(p => p.Key.TransDate))
+        {
+            Write2552Row(writer, pair.Key, pair.Value);
+        }
+
+        return groups.Count;
+    }
+
+    // The 9 caption strings repeated verbatim on every row (columns B-J), matching
+    // the legacy "09-01-26 Leakage Report 2552.csv" export exactly, embedded
+    // newlines included.
+    private static readonly object[] LeakageCaptions =
+    [
+        "Sent\r\nTo IPS", "Rejected", "Awaiting\r\nResponse", "Returned\r\nFrom IPS",
+        "Uncollectable\r\nNon-System", "Uncollectable\r\nSystem", "Flushed", "No \r\nImage", "In \r\nProcess"
+    ];
+
+    private static void Write2552Row(StreamWriter writer, LeakageKey key, double[] sums)
+    {
+        var inProcess = (long)sums[SrcInProcess];
+
+        object?[] fields =
+        [
+            $"Facility: {key.OrgName}",
+            .. LeakageCaptions,
+            key.LaneNumber,
+            (long)sums[SrcSentToIPS],
+            (long)sums[SrcIPSRejected],
+            (long)sums[SrcOutstanding],
+            (long)sums[SrcReceivedFromIPS],
+            (long)sums[SrcCollectable],
+            (long)sums[SrcUncollectableNonSystem],
+            FormatCurrency((decimal)sums[SrcUncollectableNonSystemAmount]),
+            (long)sums[SrcUncollectableSystem],
+            FormatCurrency((decimal)sums[SrcUncollectableSystemAmount]),
+            (long)sums[SrcFlush],
+            (long)sums[SrcNoImage],
+            inProcess, // W
+            0, // X
+            (long)sums[SrcIPS],
+            inProcess // Z, same value as W
         ];
 
         WriteCsvLine(writer, fields);
