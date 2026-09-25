@@ -29,6 +29,11 @@ internal static class Program
     // Raw row as returned by [RPrl].[uspr_trn_Leakage] (matches #TMP_2552 in 2552_test.sql).
     private sealed record LeakageRow(long OrgId, string OrgName, int LaneNumber, DateTime TransDate, double[] Measures);
 
+    // Raw row for 5695: no stored procedure exists for this one, it's a raw
+    // multi-table query. PlazaID/TranDate/FullFareRevenue can be null since
+    // tblUFMRecord is joined with a LEFT OUTER JOIN.
+    private sealed record UfmRow(DateTime UfmDate, long UfmId, int? PlazaId, DateTime? TranDate, decimal? FullFareRevenue);
+
     // Each import type has its own CSV column structure and aggregation, but types
     // that share a ProcedureName reuse one fetch of the raw rows (Fetch), boxed as
     // object since different procedures return different row shapes. WriteRows
@@ -82,7 +87,16 @@ internal static class Program
                        "ReceivedFromIPS,Collectable,UncollectableNonSystem,UncollectableNonSystemAmount,UncollectableSystem," +
                        "UncollectableSystemAmount,Flush,NoImage,InProcess,Zero,IPS,InProcess",
             Fetch: FetchLeakageRowsAsync,
-            WriteRows: Write2552Rows)
+            WriteRows: Write2552Rows),
+
+        // No stored procedure exists for this one -- raw SQL text against base
+        // tables, no aggregation (one row per UFM record). The name here is
+        // just a display label, not a real SQL object.
+        ["5695"] = new ImportTypeConfig(
+            ProcedureName: "[raw-sql].[5695-UFM-FullFareRevenue]",
+            HeaderRow: "txtUFMDate,UFMID,txtPlaza,txtTranDate,txtFullFare",
+            Fetch: FetchUfmRowsAsync,
+            WriteRows: Write5695Rows)
     };
 
     private static async Task<int> Main(string[] args)
@@ -569,6 +583,100 @@ internal static class Program
         ];
 
         WriteCsvLine(writer, fields);
+    }
+
+    // ---- 5695: raw SQL against base tables, no stored procedure ----
+
+    private const string UfmRevenueSql = """
+        SELECT
+            CONVERT(DATE, a.UTCDateTransmitted AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time') AS txtUFMDate,
+            a.UFMID,
+            ur.PlazaID AS txtPlaza,
+            CONVERT(DATE, ur.TransDate) AS txtTranDate,
+            ur.FullFareRevenue AS txtFullFare
+        FROM
+        (
+            SELECT
+                ubd.UFMID,
+                ubd.UTCDateTransmitted
+            FROM
+                [ICD].[dbo].[tblUFMBatchDetail] (NOLOCK) ubd
+            INNER JOIN
+                [ICD].[CCSS].[tblTransactionReadinessVIOL] trv WITH (NOLOCK)
+                ON ubd.UFMID = trv.TransID
+            WHERE
+                ubd.UTCDateTransmitted >= @startdate AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC'
+                AND ubd.UTCDateTransmitted < @enddate AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC'
+        ) a
+        LEFT OUTER JOIN
+            [ICD].[dbo].[tblUFMRecord] (NOLOCK) ur
+            ON a.UFMID = ur.UFMID
+        """;
+
+    private static async Task<object> FetchUfmRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.Text;
+        command.CommandText = UfmRevenueSql;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        // Half-open interval: @enddate is exclusive, so the chunk's last day is
+        // covered by using chunkEnd + 1 day (matching the sample script's
+        // "@enddate = DATEADD(day,1,@startdate)" for a single day).
+        command.Parameters.Add(new SqlParameter("@startdate", System.Data.SqlDbType.DateTime2) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@enddate", System.Data.SqlDbType.DateTime2) { Value = chunkEnd.Date.AddDays(1) });
+
+        var rows = new List<UfmRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var ufmDateOrdinal = reader.GetOrdinal("txtUFMDate");
+            var ufmIdOrdinal = reader.GetOrdinal("UFMID");
+            var plazaOrdinal = reader.GetOrdinal("txtPlaza");
+            var tranDateOrdinal = reader.GetOrdinal("txtTranDate");
+            var fullFareOrdinal = reader.GetOrdinal("txtFullFare");
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new UfmRow(
+                    UfmDate: reader.GetDateTime(ufmDateOrdinal),
+                    UfmId: Convert.ToInt64(reader.GetValue(ufmIdOrdinal), CultureInfo.InvariantCulture),
+                    PlazaId: reader.IsDBNull(plazaOrdinal) ? null : reader.GetInt32(plazaOrdinal),
+                    TranDate: reader.IsDBNull(tranDateOrdinal) ? null : reader.GetDateTime(tranDateOrdinal),
+                    FullFareRevenue: reader.IsDBNull(fullFareOrdinal) ? null : reader.GetDecimal(fullFareOrdinal)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write5695Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<UfmRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            // UFMID/PlazaID are identifiers, not measures -- write them as plain
+            // digits so they don't pick up CsvField's thousands-separator formatting.
+            object?[] fields =
+            [
+                $"{row.UfmDate:MM/dd/yyyy}",
+                row.UfmId.ToString(CultureInfo.InvariantCulture),
+                row.PlazaId?.ToString(CultureInfo.InvariantCulture),
+                row.TranDate is { } tranDate ? $"{tranDate:MM/dd/yyyy}" : null,
+                row.FullFareRevenue is { } fullFare ? FormatCurrency(fullFare) : null
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
     }
 
     private static void WriteCsvLine(StreamWriter writer, object?[] fields)
