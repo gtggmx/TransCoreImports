@@ -34,16 +34,28 @@ internal static class Program
     // tblUFMRecord is joined with a LEFT OUTER JOIN.
     private sealed record UfmRow(DateTime UfmDate, long UfmId, int? PlazaId, DateTime? TranDate, decimal? FullFareRevenue);
 
+    // Raw row as returned by [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum]
+    // (matches #TMP_1220 in 1220_test.sql, columns 1220 actually needs).
+    private sealed record TransactionRow(
+        DateTime TransDate, int Lane, int VehClass, decimal TollFull, decimal TollCharged, decimal TollCollected,
+        int IvisAxles, int CollectorAxles, string TransType, string OrgName, string GroupData,
+        int LaneGroupId, string LaneGroupName);
+
     // Each import type has its own CSV column structure and aggregation, but types
     // that share a ProcedureName reuse one fetch of the raw rows (Fetch), boxed as
     // object since different procedures return different row shapes. WriteRows
     // casts back to the shape its own Fetch produces, writes the rows, and returns
     // the row count.
+    // Finalize is for import types whose grouping spans the WHOLE run instead of
+    // a single chunk (e.g. 1320 sums per lane across every date/hour requested).
+    // When set, WriteRows only accumulates state and Finalize writes the final
+    // rows once after every chunk has been processed.
     private sealed record ImportTypeConfig(
         string ProcedureName,
         string HeaderRow,
         Func<SqlConnection, SqlSettings, string, DateTime, DateTime, Task<object>> Fetch,
-        Func<object, StreamWriter, long> WriteRows);
+        Func<object, StreamWriter, long> WriteRows,
+        Func<StreamWriter, long>? Finalize = null);
 
     private static readonly Dictionary<string, ImportTypeConfig> ImportTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -96,7 +108,31 @@ internal static class Program
             ProcedureName: "[raw-sql].[5695-UFM-FullFareRevenue]",
             HeaderRow: "txtUFMDate,UFMID,txtPlaza,txtTranDate,txtFullFare",
             Fetch: FetchUfmRowsAsync,
-            WriteRows: Write5695Rows)
+            WriteRows: Write5695Rows),
+
+        // Straight passthrough of [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum],
+        // one row per transaction, with PlazaID looked up locally (see
+        // GantryConvTable) since that lookup table lives on a different server
+        // with no linked server between them -- matches 1220_test.sql.
+        ["1220"] = new ImportTypeConfig(
+            ProcedureName: "[RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum]",
+            HeaderRow: "PlazaID,TransDate,TransTime,Lane,VehClass,TollFull,TollCharged,TollCollected," +
+                       "IVISAxles,CollectorAxles,TransType,OrgName,GroupData,LaneGroupID,LaneGroupName",
+            Fetch: FetchTransactionRowsAsync,
+            WriteRows: Write1220Rows),
+
+        // Same source rows as 1310 (shares its procedure, one SP call covers both),
+        // but drops Date/Hour (columns C/D) in favor of a LaneNumber column, and
+        // sums across every date/hour in the whole requested range per lane --
+        // not per gantry+hour like 1310, and not per chunk. Only Finalize writes
+        // the accumulated totals, once, after all chunks are processed.
+        ["1320"] = new ImportTypeConfig(
+            ProcedureName: "[RPrl].[uspr_trn_HourlyTraffic_1315b_1320b]",
+            HeaderRow: "Roadway,Gantry,Lane,VT axle 2,VT axle 3,VT axle 4,VT axle 5,VT axle 6+,VT," +
+                       "SP axle 2,SP axle 3,SP axle 4,SP axle 5,SP axle 6+,SP,Non-Rev,All Trans",
+            Fetch: FetchTrafficRowsAsync,
+            WriteRows: Accumulate1320Rows,
+            Finalize: Finalize1320Rows)
     };
 
     private static async Task<int> Main(string[] args)
@@ -176,6 +212,16 @@ internal static class Program
                             }
                         }
                     }
+                }
+
+                foreach (var (name, config) in importTypes)
+                {
+                    if (config.Finalize is null)
+                        continue;
+
+                    var finalCount = config.Finalize(writers[name]);
+                    totalRowsByType[name] = finalCount;
+                    Console.WriteLine($"[{name}] finalized: {finalCount} row(s)");
                 }
 
                 foreach (var writer in writers.Values)
@@ -387,6 +433,71 @@ internal static class Program
             0,
             sums[SrcNRETC],
             sums[SrcVIOL]
+        ];
+
+        WriteCsvLine(writer, fields);
+    }
+
+    // ---- 1320: gantry lanes kept separate, summed across the WHOLE requested range ----
+
+    private sealed record LaneTotalKey(string OrgName, string LaneGroupName, int LaneNumber);
+
+    // Accumulates across every chunk in the run instead of writing per chunk --
+    // 1320's grouping (OrgName, LaneGroupName, LaneNumber) has no Date/Hour, so a
+    // per-chunk row would just be a partial total for multi-week ranges.
+    private static readonly Dictionary<LaneTotalKey, long[]> LaneTotals = new();
+
+    private static long Accumulate1320Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<RawRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            var key = new LaneTotalKey(row.OrgName, row.LaneGroupName, row.LaneNumber);
+            if (!LaneTotals.TryGetValue(key, out var sums))
+            {
+                sums = new long[MeasureColumnCount];
+                LaneTotals[key] = sums;
+            }
+
+            for (var m = 0; m < MeasureColumnCount; m++)
+                sums[m] += row.Measures[m];
+        }
+
+        return LaneTotals.Count;
+    }
+
+    private static long Finalize1320Rows(StreamWriter writer)
+    {
+        foreach (var pair in LaneTotals
+            .OrderBy(p => p.Key.OrgName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.LaneGroupName, StringComparer.Ordinal)
+            .ThenBy(p => p.Key.LaneNumber))
+        {
+            Write1320Row(writer, pair.Key, pair.Value);
+        }
+
+        return LaneTotals.Count;
+    }
+
+    private static void Write1320Row(StreamWriter writer, LaneTotalKey key, long[] sums)
+    {
+        var etcSum = sums[SrcETC2] + sums[SrcETC3] + sums[SrcETC4] + sums[SrcETC5] + sums[SrcETC6_9];
+        var nonRev = sums[SrcNRETC];
+        var allTrans = sums[SrcVIOL] + etcSum + nonRev;
+
+        // AR/CardNonRev/PassNR and the 4 blank columns are dropped entirely to
+        // match the legacy 1320 report's layout -- straight to Non-Rev (=NRETC)
+        // and All Trans (=VIOL + ETC_Sum + NRETC, no longer including AR/CardNonRev/PassNR).
+        object?[] fields =
+        [
+            $"Facility: {key.OrgName}",
+            $"Lane Group: {key.LaneGroupName}",
+            key.LaneNumber,
+            sums[0], sums[1], sums[2], sums[3], sums[4], sums[SrcVIOL], // VIOL2, VIOL3, VIOL4, VIOL5, VIOL6_9, VIOL
+            sums[SrcETC2], sums[SrcETC3], sums[SrcETC4], sums[SrcETC5], sums[SrcETC6_9],
+            etcSum,
+            nonRev,
+            allTrans
         ];
 
         WriteCsvLine(writer, fields);
@@ -671,6 +782,139 @@ internal static class Program
                 row.PlazaId?.ToString(CultureInfo.InvariantCulture),
                 row.TranDate is { } tranDate ? $"{tranDate:MM/dd/yyyy}" : null,
                 row.FullFareRevenue is { } fullFare ? FormatCurrency(fullFare) : null
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    // ---- 1220: [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum], straight passthrough ----
+
+    private static async Task<object> FetchTransactionRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.StoredProcedure;
+        command.CommandText = procedureName;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        command.Parameters.Add(new SqlParameter("@inOrgID", System.Data.SqlDbType.Int) { Value = 0 });
+        command.Parameters.Add(new SqlParameter("@ReportType", System.Data.SqlDbType.Int) { Value = 1 });
+        command.Parameters.Add(new SqlParameter("@GroupBy", System.Data.SqlDbType.Int) { Value = 1 });
+        command.Parameters.Add(new SqlParameter("@selectVal", System.Data.SqlDbType.NVarChar, -1) { Value = DBNull.Value });
+        command.Parameters.Add(new SqlParameter("@inStartDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@inEndDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date });
+        command.Parameters.Add(new SqlParameter("@inDayType", System.Data.SqlDbType.Int) { Value = 2 });
+        command.Parameters.Add(new SqlParameter("@inLaneGroupID", System.Data.SqlDbType.VarChar, 10) { Value = "0" });
+
+        var rows = new List<TransactionRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var transDateOrdinal = reader.GetOrdinal("TransDate");
+            var laneOrdinal = reader.GetOrdinal("Lane");
+            var vehClassOrdinal = reader.GetOrdinal("VehClass");
+            var tollFullOrdinal = reader.GetOrdinal("TollFull");
+            var tollChargedOrdinal = reader.GetOrdinal("TollCharged");
+            var tollCollectedOrdinal = reader.GetOrdinal("TollCollected");
+            var ivisAxlesOrdinal = reader.GetOrdinal("IVISAxles");
+            var collectorAxlesOrdinal = reader.GetOrdinal("CollectorAxles");
+            var transTypeOrdinal = reader.GetOrdinal("TransType");
+            var orgNameOrdinal = reader.GetOrdinal("OrgName");
+            var groupDataOrdinal = reader.GetOrdinal("GroupData");
+            var laneGroupIdOrdinal = reader.GetOrdinal("LaneGroupID");
+            var laneGroupNameOrdinal = reader.GetOrdinal("LaneGroupName");
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new TransactionRow(
+                    TransDate: reader.GetDateTime(transDateOrdinal),
+                    Lane: Convert.ToInt32(reader.GetValue(laneOrdinal), CultureInfo.InvariantCulture),
+                    VehClass: Convert.ToInt32(reader.GetValue(vehClassOrdinal), CultureInfo.InvariantCulture),
+                    TollFull: Convert.ToDecimal(reader.GetValue(tollFullOrdinal), CultureInfo.InvariantCulture),
+                    TollCharged: Convert.ToDecimal(reader.GetValue(tollChargedOrdinal), CultureInfo.InvariantCulture),
+                    TollCollected: Convert.ToDecimal(reader.GetValue(tollCollectedOrdinal), CultureInfo.InvariantCulture),
+                    IvisAxles: Convert.ToInt32(reader.GetValue(ivisAxlesOrdinal), CultureInfo.InvariantCulture),
+                    CollectorAxles: Convert.ToInt32(reader.GetValue(collectorAxlesOrdinal), CultureInfo.InvariantCulture),
+                    TransType: reader.GetValue(transTypeOrdinal).ToString() ?? "",
+                    OrgName: reader.GetValue(orgNameOrdinal).ToString() ?? "",
+                    GroupData: reader.IsDBNull(groupDataOrdinal) ? "" : reader.GetValue(groupDataOrdinal).ToString() ?? "",
+                    LaneGroupId: Convert.ToInt32(reader.GetValue(laneGroupIdOrdinal), CultureInfo.InvariantCulture),
+                    LaneGroupName: reader.GetValue(laneGroupNameOrdinal).ToString() ?? ""));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    // Mirrors #TMP_GANTRY_CONV in 1220_test.sql. GantryConv lives in TCore_Import
+    // on a different server with no linked server, so the RoadWay/GantryNum ->
+    // PlazaID lookup is embedded here instead of joined via SQL.
+    private static readonly (string RoadWay, string GantryNum, int PlazaId)[] GantryConvTable =
+    [
+        ("SR112", "20", 107120), ("SR112", "40", 107140), ("SR112", "60", 107160), ("SR112", "80", 107180),
+        ("836-17", "36", 107236), ("836-17", "39", 107239), ("836-17", "40", 107240), ("836-17", "41", 107241),
+        ("836-17", "42", 107242), ("836-17", "55", 107255), ("836-17", "58", 107258), ("836-17", "60", 107260),
+        ("836-57", "27", 107227), ("836-57", "30", 107230), ("836-57", "32", 107232), ("836-57", "63", 107263),
+        ("836-57", "64", 107264), ("836-57", "68", 107268), ("836-57", "70", 107270),
+        ("836-97", "21", 107221), ("836-97", "23", 107223), ("836-97", "26", 107226), ("836-97", "75", 107275),
+        ("836-97", "76", 107276), ("836-97", "79", 107279),
+        ("SR874", "20", 107320), ("SR874", "30", 107330), ("SR874", "40", 107340), ("SR874", "60", 107360),
+        ("SR874", "70", 107370), ("SR874", "80", 107380),
+        ("SR878", "20", 107620), ("SR878", "40", 107640), ("SR878", "60", 107660), ("SR878", "80", 107680),
+        ("SR924", "20", 107420), ("SR924", "40", 107440), ("SR924", "60", 107460), ("SR924", "80", 107480)
+    ];
+
+    private static readonly Dictionary<(string RoadWay, string GantryNum), int> GantryConvLookup =
+        GantryConvTable.ToDictionary(g => (g.RoadWay, g.GantryNum), g => g.PlazaId);
+
+    // Mirrors the SQL join condition in 1220_test.sql:
+    // RoadWay = TRIM(SUBSTRING(LaneGroupName,1,CHARINDEX(' Gantry',LaneGroupName))) AND
+    // GantryNum = TRIM(SUBSTRING(LaneGroupName,CHARINDEX(' Gantry',LaneGroupName)+8,...))
+    private static int? LookupPlazaId(string laneGroupName)
+    {
+        int spaceIdx = laneGroupName.IndexOf(" Gantry", StringComparison.Ordinal);
+        if (spaceIdx < 0)
+            return null;
+
+        string roadWay = laneGroupName.Substring(0, spaceIdx).Trim();
+        string gantryNum = laneGroupName.Substring(spaceIdx + 8).Trim();
+
+        return GantryConvLookup.TryGetValue((roadWay, gantryNum), out var plazaId) ? plazaId : (int?)null;
+    }
+
+    private static long Write1220Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<TransactionRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            int? plazaId = LookupPlazaId(row.LaneGroupName);
+
+            object?[] fields =
+            [
+                plazaId?.ToString(CultureInfo.InvariantCulture),
+                $"{row.TransDate:MM/dd/yyyy}",
+                $"{row.TransDate:HH:mm:ss}",
+                row.Lane,
+                row.VehClass,
+                row.TollFull,
+                row.TollCharged,
+                row.TollCollected,
+                row.IvisAxles,
+                row.CollectorAxles,
+                row.TransType,
+                row.OrgName,
+                row.GroupData,
+                row.LaneGroupId,
+                row.LaneGroupName
             ];
 
             WriteCsvLine(writer, fields);
