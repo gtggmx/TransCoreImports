@@ -1,6 +1,7 @@
 using System.Globalization;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using Microsoft.Data.SqlClient;
 
 namespace TransCoreImports;
@@ -50,6 +51,13 @@ internal static class Program
     // a single chunk (e.g. 1320 sums per lane across every date/hour requested).
     // When set, WriteRows only accumulates state and Finalize writes the final
     // rows once after every chunk has been processed.
+    // 4438: one row of the roll-up of [dbo].[uspr_csc_UniqueTransponderReport_Sarad_Migration].
+    // One group per (date, state, agency, revenue type); ByRoad holds the per-road
+    // count/amount, DistinctTransponders is across ALL roads of the group.
+    private sealed record TransponderGroup(
+        DateTime Date, string State, string Agency, string RevenueType,
+        SortedDictionary<string, (long Count, long Cents)> ByRoad, int DistinctTransponders);
+
     private sealed record ImportTypeConfig(
         string ProcedureName,
         string HeaderRow,
@@ -120,6 +128,17 @@ internal static class Program
                        "IVISAxles,CollectorAxles,TransType,OrgName,GroupData,LaneGroupID,LaneGroupName",
             Fetch: FetchTransactionRowsAsync,
             WriteRows: Write1220Rows),
+
+        // Per-transaction OTO rows rolled up in the app: per road (SR 112/836/874/878/924),
+        // date, state, agency and revenue type -> transaction count and charged amount,
+        // plus the group totals and distinct-transponder count repeated on each road
+        // row. Header and layout match the "4438_TestFrom Susan" SSRS sample.
+        ["4438"] = new ImportTypeConfig(
+            ProcedureName: "[dbo].[uspr_csc_UniqueTransponderReport_Sarad_Migration]",
+            HeaderRow: "Textbox778,RoadName,LaneExitDate1,State3,Agency3,RevenueType3,TransponderID2," +
+                       "Transactions,ChargedAmount,Transactions2,ChargedAmount1",
+            Fetch: FetchUniqueTransponderRowsAsync,
+            WriteRows: Write4438Rows),
 
         // Same source rows as 1310 (shares its procedure, one SP call covers both),
         // but drops Date/Hour (columns C/D) in favor of a LaneNumber column, and
@@ -788,6 +807,145 @@ internal static class Program
         }
 
         return rows.Count;
+    }
+
+    // ---- 4438: [dbo].[uspr_csc_UniqueTransponderReport_Sarad_Migration], rolled up while streaming ----
+
+    private static readonly Regex RoadCodeRegex = new(@"^\s*SR\s*(\d+)", RegexOptions.IgnoreCase | RegexOptions.Compiled);
+
+    // "SR836EAST(at97thAve)" / "SR836West(87thAveRamp)" -> "SR 836". Anything that
+    // doesn't start with SR<digits> keeps its raw name so it shows up instead of vanishing.
+    private static string RoadGroupName(string roadName)
+    {
+        var m = RoadCodeRegex.Match(roadName);
+        return m.Success ? "SR " + m.Groups[1].Value : roadName.Trim();
+    }
+
+    private static async Task<object> FetchUniqueTransponderRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.StoredProcedure;
+        command.CommandText = procedureName;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        command.Parameters.Add(new SqlParameter("@inStartDate", System.Data.SqlDbType.DateTime) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@inEndDate", System.Data.SqlDbType.DateTime) { Value = chunkEnd.Date });
+        command.Parameters.Add(new SqlParameter("@inReportType", System.Data.SqlDbType.TinyInt) { Value = (byte)1 });
+        command.Parameters.Add(new SqlParameter("@inDateType", System.Data.SqlDbType.TinyInt) { Value = (byte)1 });
+        command.Parameters.Add(new SqlParameter("@inOrgID", System.Data.SqlDbType.BigInt) { Value = 0L });
+
+        // A chunk is millions of raw rows, so aggregate while streaming instead of
+        // keeping them. The distinct-transponder sets are per (date,state,agency,type).
+        var groups = new Dictionary<(DateTime Date, string State, string Agency, string RevType),
+            (SortedDictionary<string, (long Count, long Cents)> ByRoad, HashSet<string> Transponders)>();
+        var unknownRoads = new HashSet<string>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var roadOrdinal = reader.GetOrdinal("RoadName");
+            var laneExitOrdinal = reader.GetOrdinal("LaneExitDate");
+            var transponderOrdinal = reader.GetOrdinal("TransponderID");
+            var agencyOrdinal = reader.GetOrdinal("Agency");
+            var stateOrdinal = reader.GetOrdinal("State");
+            var chargedOrdinal = reader.GetOrdinal("ChargedAmt");
+            var revenueTypeOrdinal = reader.GetOrdinal("RevenueType");
+
+            while (await reader.ReadAsync())
+            {
+                // LaneExitDate is text like "07/01/2026  000000"; only the date part is used.
+                var laneExit = reader.GetString(laneExitOrdinal);
+                var date = DateTime.ParseExact(laneExit.AsSpan(0, 10), "MM/dd/yyyy", CultureInfo.InvariantCulture);
+
+                var road = RoadGroupName(reader.IsDBNull(roadOrdinal) ? "" : reader.GetString(roadOrdinal));
+                if (!road.StartsWith("SR ", StringComparison.Ordinal))
+                    unknownRoads.Add(road);
+
+                var key = (
+                    date,
+                    reader.GetString(stateOrdinal).Trim(),
+                    reader.GetString(agencyOrdinal).Trim(),
+                    reader.GetString(revenueTypeOrdinal).Trim());
+
+                if (!groups.TryGetValue(key, out var group))
+                {
+                    group = (new SortedDictionary<string, (long, long)>(StringComparer.Ordinal), new HashSet<string>());
+                    groups[key] = group;
+                }
+
+                var cents = reader.IsDBNull(chargedOrdinal)
+                    ? 0L
+                    : long.Parse(reader.GetString(chargedOrdinal).Trim(), CultureInfo.InvariantCulture);
+                group.ByRoad.TryGetValue(road, out var existing);
+                group.ByRoad[road] = (existing.Count + 1, existing.Cents + cents);
+
+                group.Transponders.Add(reader.GetString(transponderOrdinal).Trim());
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        if (unknownRoads.Count > 0)
+            Console.WriteLine($"    [4438] WARNING: road name(s) not in SR<number> form: {string.Join(" | ", unknownRoads.Select(r => r.Length == 0 ? "(blank)" : r))}");
+
+        // Every group lists every road seen in the chunk (zero-filled), like the sample does.
+        var allRoads = groups.Values.SelectMany(g => g.ByRoad.Keys).Distinct().OrderBy(r => r, StringComparer.Ordinal).ToList();
+
+        return groups
+            .OrderBy(g => g.Key.Date)
+            .ThenBy(g => g.Key.State, StringComparer.Ordinal)
+            .ThenBy(g => g.Key.Agency, StringComparer.Ordinal)
+            .ThenBy(g => g.Key.RevType, StringComparer.Ordinal)
+            .Select(g =>
+            {
+                var byRoad = new SortedDictionary<string, (long Count, long Cents)>(StringComparer.Ordinal);
+                foreach (var road in allRoads)
+                    byRoad[road] = g.Value.ByRoad.TryGetValue(road, out var v) ? v : (0, 0);
+                return new TransponderGroup(g.Key.Date, g.Key.State, g.Key.Agency, g.Key.RevType, byRoad, g.Value.Transponders.Count);
+            })
+            .ToList();
+    }
+
+    // "$7,644.45 " -- the trailing space is part of the SSRS currency format in the sample.
+    private static string FormatDollarsFromCents(long cents) =>
+        "$" + (cents / 100m).ToString("#,##0.00", CultureInfo.InvariantCulture) + " ";
+
+    private static long Write4438Rows(object rowsObj, StreamWriter writer)
+    {
+        var groups = (IReadOnlyList<TransponderGroup>)rowsObj;
+        long written = 0;
+        foreach (var group in groups)
+        {
+            var totalCount = group.ByRoad.Values.Sum(v => v.Count);
+            var totalCents = group.ByRoad.Values.Sum(v => v.Cents);
+
+            foreach (var (road, value) in group.ByRoad)
+            {
+                object?[] fields =
+                [
+                    "Lane Date",
+                    road,
+                    group.Date.ToString("M/d/yyyy", CultureInfo.InvariantCulture),
+                    group.State,
+                    group.Agency,
+                    group.RevenueType,
+                    (long)group.DistinctTransponders,
+                    value.Count,
+                    FormatDollarsFromCents(value.Cents),
+                    totalCount,
+                    FormatDollarsFromCents(totalCents)
+                ];
+
+                WriteCsvLine(writer, fields);
+                written++;
+            }
+        }
+
+        return written;
     }
 
     // ---- 1220: [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum], straight passthrough ----
