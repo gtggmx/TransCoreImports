@@ -4,3 +4,4 @@ obj/
 TransCoreImports/Output/
 TransCoreImports/tempout/
 appsettings.local.json
+TransCoreLoader/logs/
