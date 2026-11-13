@@ -197,6 +197,17 @@ internal static class Program
             WriteRows: Write5678Rows,
             ChunkDays: 3660),
 
+        // Raw SQL (5678_V1, SQL_TEST/5678_V1_export.sql): violation count and indicated revenue per
+        // transmit date and transaction date (no plaza). Same optimized hourly-bucket form as 5695.
+        // The grouping spans the whole range, so the range goes to SQL in one call. The name here is
+        // just a display label, not a real SQL object.
+        ["5678_V1"] = new ImportTypeConfig(
+            ProcedureName: "[raw-sql].[5678_V1-ViolationsByDate]",
+            HeaderRow: "DateTransmitted,TransactionDate,TransactionCount,IndicatedRevenueOrig",
+            Fetch: FetchViolByDateRowsAsync,
+            WriteRows: Write5678V1Rows,
+            ChunkDays: 3660),
+
         // Same source rows as 1310 (shares its procedure, one SP call covers both),
         // but drops Date/Hour (columns C/D) in favor of a LaneNumber column, and
         // sums across every date/hour in the whole requested range per lane --
@@ -953,6 +964,105 @@ internal static class Program
                 row.ViolCount, FormatCurrency(row.ViolRevenue)
             ];
 
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    // ---- 5678_V1: violations by transmit date / transaction date, raw SQL ----
+
+    private sealed record ViolByDateRow(string DateTransmitted, string TransactionDate, string TransactionCount, string IndicatedRevenue);
+
+    // Same query as 5695 without the plaza column. @STDate/@ENDDate are the Eastern days (@ENDDate
+    // exclusive); the window is converted to UTC in SQL with the Windows time zone. TransDate is
+    // already local time, so only the transmit time is converted.
+    private const string ViolByDateSql = """
+        SET NOCOUNT ON;
+
+        DECLARE @STDate_UTC  datetime = CAST(@STDate  AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+        DECLARE @ENDDate_UTC datetime = CAST(@ENDDate AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+
+        WITH base AS (
+            SELECT
+                -- truncate to the hour first; AT TIME ZONE then runs per hour bucket, not per row
+                DATEADD(HOUR, DATEDIFF(HOUR, 0, ubd.UTCDateTransmitted), 0) AS SentHourUTC,
+                CAST(trv.TransDate AS date)                                 AS TransDay,
+                trv.OrgID, ur.IndicatedRevenueOrig
+            FROM ICD.dbo.tblUFMBatchDetail   ubd WITH (NOLOCK)
+            JOIN ICD.dbo.tblCoopTagTollUsage trv WITH (NOLOCK) ON trv.TransID = ubd.UFMID
+            LEFT JOIN ICD.dbo.tblUFMRecord   ur  WITH (NOLOCK) ON ur.UFMID   = ubd.UFMID
+            WHERE ubd.UTCDateTransmitted >= @STDate_UTC
+              AND ubd.UTCDateTransmitted <  @ENDDate_UTC
+              AND ubd.DispCode = 'SUC'
+              AND trv.TransType = 'VIOL'
+        ),
+        hourly AS (
+            SELECT SentHourUTC, TransDay, OrgID,
+                   SUM(IndicatedRevenueOrig) AS Rev,
+                   COUNT(*)                  AS Cnt
+            FROM base
+            GROUP BY SentHourUTC, TransDay, OrgID
+        ),
+        local AS (
+            SELECT h.*,
+                   CAST(SentHourUTC AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS date) AS SentDate
+            FROM hourly h
+        )
+        SELECT CONVERT(varchar(10), SentDate, 101) AS DateTransmitted,
+               CONVERT(varchar(10), TransDay, 101) AS TransactionDate,
+               FORMAT(SUM(Cnt), 'N0')              AS TransactionCount,
+               FORMAT(SUM(Rev), 'C', 'en-US')      AS IndicatedRevenueOrig
+        FROM local l
+        JOIN CPC.dbo.tblOrg o WITH (NOLOCK) ON o.OrgID = l.OrgID
+        GROUP BY SentDate, TransDay
+        ORDER BY SentDate, TransDay
+        OPTION (RECOMPILE);
+        """;
+
+    private static async Task<object> FetchViolByDateRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = ViolByDateSql;
+        command.CommandTimeout = Math.Max(settings.CommandTimeoutSeconds, 7200);
+
+        command.Parameters.Add(new SqlParameter("@STDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        // The query's end date is exclusive; the program's end date is inclusive.
+        command.Parameters.Add(new SqlParameter("@ENDDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date.AddDays(1) });
+
+        var rows = new List<ViolByDateRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            if (reader.FieldCount != 4)
+                continue;
+
+            string Text(int ordinal) => reader.IsDBNull(ordinal) ? "" : Convert.ToString(reader.GetValue(ordinal), CultureInfo.InvariantCulture) ?? "";
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new ViolByDateRow(Text(0), Text(1), Text(2), Text(3)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write5678V1Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<ViolByDateRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            // Values are already the text the query formats ("12,600", "$4,218.39"): written as
+            // strings, quoted only when they contain a comma.
+            object?[] fields = [row.DateTransmitted, row.TransactionDate, row.TransactionCount, row.IndicatedRevenue];
             WriteCsvLine(writer, fields);
         }
 
