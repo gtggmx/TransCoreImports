@@ -30,10 +30,12 @@ internal static class Program
     // Raw row as returned by [RPrl].[uspr_trn_Leakage] (matches #TMP_2552 in 2552_test.sql).
     private sealed record LeakageRow(long OrgId, string OrgName, int LaneNumber, DateTime TransDate, double[] Measures);
 
-    // Raw row for 5695: no stored procedure exists for this one, it's a raw
-    // multi-table query. PlazaID/TranDate/FullFareRevenue can be null since
-    // tblUFMRecord is joined with a LEFT OUTER JOIN.
-    private sealed record UfmRow(DateTime UfmDate, long UfmId, int? PlazaId, DateTime? TranDate, decimal? FullFareRevenue);
+    // Raw row for 5695 (violation summary by transmit date / transaction date / plaza): no stored
+    // procedure exists for this one, it's a raw query. All values are the text the query formats
+    // ("12,600", "$4,218.39"); PlazaID and the revenue can be empty since tblUFMRecord is joined
+    // with a LEFT OUTER JOIN.
+    private sealed record ViolSummaryRow(
+        string DateTransmitted, string TransactionDate, string PlazaId, string TransactionCount, string IndicatedRevenue);
 
     // Raw row as returned by [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum]
     // (matches #TMP_1220 in 1220_test.sql, columns 1220 actually needs).
@@ -116,10 +118,11 @@ internal static class Program
         // tables, no aggregation (one row per UFM record). The name here is
         // just a display label, not a real SQL object.
         ["5695"] = new ImportTypeConfig(
-            ProcedureName: "[raw-sql].[5695-UFM-FullFareRevenue]",
-            HeaderRow: "txtUFMDate,UFMID,txtPlaza,txtTranDate,txtFullFare",
-            Fetch: FetchUfmRowsAsync,
-            WriteRows: Write5695Rows),
+            ProcedureName: "[raw-sql].[5695-ViolationsByTransmitDate]",
+            HeaderRow: "DateTransmitted,TransactionDate,PlazaID,TransactionCount,IndicatedRevenueOrig",
+            Fetch: FetchViolSummaryRowsAsync,
+            WriteRows: Write5695Rows,
+            ChunkDays: 3660),
 
         // Straight passthrough of [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum],
         // one row per transaction, with PlazaID looked up locally (see
@@ -760,35 +763,57 @@ internal static class Program
         WriteCsvLine(writer, fields);
     }
 
-    // ---- 5695: raw SQL against base tables, no stored procedure ----
+    // ---- 5695: violation summary by transmit date / transaction date / plaza, raw SQL ----
 
-    private const string UfmRevenueSql = """
-        SELECT
-            CONVERT(DATE, a.UTCDateTransmitted AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time') AS txtUFMDate,
-            a.UFMID,
-            ur.PlazaID AS txtPlaza,
-            CONVERT(DATE, ur.TransDate) AS txtTranDate,
-            ur.FullFareRevenue AS txtFullFare
-        FROM
-        (
+    // Optimized version of the row-level query: hour buckets first, time-zone conversion only on
+    // the small grouped set. Output verified identical to the row-level original (169 rows, 7/22).
+    // @STDate/@ENDDate are the Eastern days (@ENDDate exclusive); the Eastern window is converted to UTC
+    // in SQL. TransDate is already local time, so only the transmit time is converted.
+    private const string ViolSummarySql = """
+        SET NOCOUNT ON;
+
+        DECLARE @STDate_UTC  datetime = CAST(@STDate  AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+        DECLARE @ENDDate_UTC datetime = CAST(@ENDDate AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+
+        WITH base AS (
             SELECT
-                ubd.UFMID,
-                ubd.UTCDateTransmitted
-            FROM
-                [ICD].[dbo].[tblUFMBatchDetail] (NOLOCK) ubd
-            INNER JOIN
-                [ICD].[CCSS].[tblTransactionReadinessVIOL] trv WITH (NOLOCK)
-                ON ubd.UFMID = trv.TransID
-            WHERE
-                ubd.UTCDateTransmitted >= @startdate AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC'
-                AND ubd.UTCDateTransmitted < @enddate AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC'
-        ) a
-        LEFT OUTER JOIN
-            [ICD].[dbo].[tblUFMRecord] (NOLOCK) ur
-            ON a.UFMID = ur.UFMID
+                -- truncate to the hour first; AT TIME ZONE then runs per hour bucket, not per row
+                DATEADD(HOUR, DATEDIFF(HOUR, 0, ubd.UTCDateTransmitted), 0) AS SentHourUTC,
+                CAST(trv.TransDate AS date)                                 AS TransDay,
+                trv.OrgID, ur.PlazaID, ur.IndicatedRevenueOrig
+            FROM ICD.dbo.tblUFMBatchDetail   ubd WITH (NOLOCK)
+            JOIN ICD.dbo.tblCoopTagTollUsage trv WITH (NOLOCK) ON trv.TransID = ubd.UFMID
+            LEFT JOIN ICD.dbo.tblUFMRecord   ur  WITH (NOLOCK) ON ur.UFMID   = ubd.UFMID
+            WHERE ubd.UTCDateTransmitted >= @STDate_UTC
+              AND ubd.UTCDateTransmitted <  @ENDDate_UTC
+              AND ubd.DispCode = 'SUC'
+              AND trv.TransType = 'VIOL'
+        ),
+        hourly AS (
+            SELECT SentHourUTC, TransDay, OrgID, PlazaID,
+                   SUM(IndicatedRevenueOrig) AS Rev,
+                   COUNT(*)                  AS Cnt
+            FROM base
+            GROUP BY SentHourUTC, TransDay, OrgID, PlazaID
+        ),
+        local AS (
+            SELECT h.*,
+                   CAST(SentHourUTC AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS date) AS SentDate
+            FROM hourly h
+        )
+        SELECT CONVERT(varchar(10), SentDate, 101) AS DateTransmitted,
+               CONVERT(varchar(10), TransDay, 101) AS TransactionDate,
+               l.PlazaID                           AS PlazaID,
+               FORMAT(SUM(Cnt), 'N0')              AS TransactionCount,
+               FORMAT(SUM(Rev), 'C', 'en-US')      AS IndicatedRevenueOrig
+        FROM local l
+        JOIN CPC.dbo.tblOrg o WITH (NOLOCK) ON o.OrgID = l.OrgID
+        GROUP BY SentDate, TransDay, l.PlazaID
+        ORDER BY SentDate, TransDay, l.PlazaID
+        OPTION (RECOMPILE);
         """;
 
-    private static async Task<object> FetchUfmRowsAsync(
+    private static async Task<object> FetchViolSummaryRowsAsync(
         SqlConnection connection,
         SqlSettings settings,
         string procedureName,
@@ -796,35 +821,26 @@ internal static class Program
         DateTime chunkEnd)
     {
         await using var command = connection.CreateCommand();
-        command.CommandType = System.Data.CommandType.Text;
-        command.CommandText = UfmRevenueSql;
-        command.CommandTimeout = settings.CommandTimeoutSeconds;
+        command.CommandText = ViolSummarySql;
+        command.CommandTimeout = Math.Max(settings.CommandTimeoutSeconds, 7200);
 
-        // Half-open interval: @enddate is exclusive, so the chunk's last day is
-        // covered by using chunkEnd + 1 day (matching the sample script's
-        // "@enddate = DATEADD(day,1,@startdate)" for a single day).
-        command.Parameters.Add(new SqlParameter("@startdate", System.Data.SqlDbType.DateTime2) { Value = chunkStart.Date });
-        command.Parameters.Add(new SqlParameter("@enddate", System.Data.SqlDbType.DateTime2) { Value = chunkEnd.Date.AddDays(1) });
+        command.Parameters.Add(new SqlParameter("@STDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        // The query's end date is exclusive; the program's end date is inclusive.
+        command.Parameters.Add(new SqlParameter("@ENDDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date.AddDays(1) });
 
-        var rows = new List<UfmRow>();
+        var rows = new List<ViolSummaryRow>();
 
         await using var reader = await command.ExecuteReaderAsync();
         do
         {
-            var ufmDateOrdinal = reader.GetOrdinal("txtUFMDate");
-            var ufmIdOrdinal = reader.GetOrdinal("UFMID");
-            var plazaOrdinal = reader.GetOrdinal("txtPlaza");
-            var tranDateOrdinal = reader.GetOrdinal("txtTranDate");
-            var fullFareOrdinal = reader.GetOrdinal("txtFullFare");
+            if (reader.FieldCount != 5)
+                continue;
+
+            string Text(int ordinal) => reader.IsDBNull(ordinal) ? "" : Convert.ToString(reader.GetValue(ordinal), CultureInfo.InvariantCulture) ?? "";
 
             while (await reader.ReadAsync())
             {
-                rows.Add(new UfmRow(
-                    UfmDate: reader.GetDateTime(ufmDateOrdinal),
-                    UfmId: Convert.ToInt64(reader.GetValue(ufmIdOrdinal), CultureInfo.InvariantCulture),
-                    PlazaId: reader.IsDBNull(plazaOrdinal) ? null : reader.GetInt32(plazaOrdinal),
-                    TranDate: reader.IsDBNull(tranDateOrdinal) ? null : reader.GetDateTime(tranDateOrdinal),
-                    FullFareRevenue: reader.IsDBNull(fullFareOrdinal) ? null : reader.GetDecimal(fullFareOrdinal)));
+                rows.Add(new ViolSummaryRow(Text(0), Text(1), Text(2), Text(3), Text(4)));
             }
         }
         while (await reader.NextResultAsync());
@@ -834,18 +850,14 @@ internal static class Program
 
     private static long Write5695Rows(object rowsObj, StreamWriter writer)
     {
-        var rows = (IReadOnlyList<UfmRow>)rowsObj;
+        var rows = (IReadOnlyList<ViolSummaryRow>)rowsObj;
         foreach (var row in rows)
         {
-            // UFMID/PlazaID are identifiers, not measures -- write them as plain
-            // digits so they don't pick up CsvField's thousands-separator formatting.
+            // Values are already the text the query formats ("12,600", "$4,218.39") and PlazaID
+            // is an identifier -- written as strings, quoted only when they contain a comma.
             object?[] fields =
             [
-                $"{row.UfmDate:MM/dd/yyyy}",
-                row.UfmId.ToString(CultureInfo.InvariantCulture),
-                row.PlazaId?.ToString(CultureInfo.InvariantCulture),
-                row.TranDate is { } tranDate ? $"{tranDate:MM/dd/yyyy}" : null,
-                row.FullFareRevenue is { } fullFare ? FormatCurrency(fullFare) : null
+                row.DateTransmitted, row.TransactionDate, row.PlazaId, row.TransactionCount, row.IndicatedRevenue
             ];
 
             WriteCsvLine(writer, fields);
