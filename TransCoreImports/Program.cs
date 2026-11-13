@@ -63,7 +63,10 @@ internal static class Program
         string HeaderRow,
         Func<SqlConnection, SqlSettings, string, DateTime, DateTime, Task<object>> Fetch,
         Func<object, StreamWriter, long> WriteRows,
-        Func<StreamWriter, long>? Finalize = null);
+        Func<StreamWriter, long>? Finalize = null,
+        // Days of data fetched per procedure call. Types that return one row per
+        // transaction (hundreds of thousands a day) use 1 so a chunk fits in memory.
+        int ChunkDays = MaxDaysPerCall);
 
     private static readonly Dictionary<string, ImportTypeConfig> ImportTypes = new(StringComparer.OrdinalIgnoreCase)
     {
@@ -140,6 +143,46 @@ internal static class Program
             Fetch: FetchUniqueTransponderRowsAsync,
             WriteRows: Write4438Rows),
 
+        // Per-transaction OTO rows (every road in one file), straight from
+        // [dbo].[uspr_csc_OTOFileDetails_sql_Sarad_Migration]. Matches the legacy 5625
+        // report's columns B..AB only: its batch label (A) and batch/grand total columns
+        // are left out because the new source keeps no transaction->batch link.
+        // One day per call: a day is ~800,000 rows.
+        ["5625"] = new ImportTypeConfig(
+            ProcedureName: "[dbo].[uspr_csc_OTOFileDetails_sql_Sarad_Migration]",
+            HeaderRow: "PlazaCode,LaneNumber,LaneType,TollCollector,LaneExitDate,TransponderID,Agency,State,SignedBalance," +
+                       "CollectedAmt,ChargedAmt,FullAmt,LowBattery,TransponderStatus,LowBalance,InsufficentFunds,CreditListNum," +
+                       "CreditListUpdated,AntiPassbackCode,AVCClass,TransponderClass,RevenueType,ViolationCode,ReaderConfirmation," +
+                       "AmtechTransponderNumber,VehicleSpeed,RejectReasonCode",
+            Fetch: FetchOtoDetailRowsAsync,
+            WriteRows: Write5625Rows,
+            ChunkDays: 1),
+
+        // Raw multi-table SQL (6192_20261008.sql): violation transactions joined to the TRIP /
+        // UFM amendment tables, counted and totalled per road and category over the WHOLE
+        // requested range -- so the range goes to SQL in one call (ChunkDays well above the
+        // 31-day web limit), not weekly, or the categories would repeat once per chunk.
+        // The name here is just a display label, not a real SQL object.
+        ["6192"] = new ImportTypeConfig(
+            ProcedureName: "[raw-sql].[6192-ViolationCategories]",
+            HeaderRow: "RoadWay,Category,TripSecondaryCode_Joined,TotalCount,TotalAmount",
+            Fetch: FetchViolationCategoryRowsAsync,
+            WriteRows: Write6192Rows,
+            ChunkDays: 3660),
+
+        // Raw SQL (5680 "ByTransmitDate" query, hourly-bucket version): ETCX records successfully
+        // transmitted in the requested Eastern-time window, ETC revenue/count per plaza, transaction
+        // date and transmit date (both converted to Eastern). The result set is written exactly as
+        // the query returns it, including its two blank placeholder columns. The grouping spans the
+        // whole range, so the range goes to SQL in one call. The name here is just a display
+        // label, not a real SQL object.
+        ["5680"] = new ImportTypeConfig(
+            ProcedureName: "[raw-sql].[5680-UFMByTransmitDate]",
+            HeaderRow: "OrgName,textbox47_ignore,Roadway_Gantry,PlazaID,ETC_Revenue,ETC_Count,TransactionDate,DateTransmitted",
+            Fetch: FetchTransmitSummaryRowsAsync,
+            WriteRows: Write5680Rows,
+            ChunkDays: 3660),
+
         // Same source rows as 1310 (shares its procedure, one SP call covers both),
         // but drops Date/Hour (columns C/D) in favor of a LaneNumber column, and
         // sums across every date/hour in the whole requested range per lane --
@@ -206,9 +249,11 @@ internal static class Program
                 {
                     await connection.OpenAsync();
 
-                    foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate))
+                    foreach (var procGroup in byProcedure)
                     {
-                        foreach (var procGroup in byProcedure)
+                        // Types sharing a procedure share one call, so the smallest chunk wins.
+                        var chunkDays = procGroup.Min(t => t.Config.ChunkDays);
+                        foreach (var (chunkStart, chunkEnd) in SplitIntoWeeklyChunks(startDate, endDate, chunkDays))
                         {
                             var typeNames = string.Join("+", procGroup.Select(t => t.Name));
                             Console.WriteLine($"[{typeNames}]  {chunkStart:yyyy-MM-dd} .. {chunkEnd:yyyy-MM-dd} ...");
@@ -948,6 +993,474 @@ internal static class Program
         return written;
     }
 
+    // ---- 5680: UFM transmit summary, raw SQL ----
+
+    private sealed record TransmitSummaryRow(
+        string OrgName, string Placeholder1, string Placeholder2, string PlazaId,
+        string EtcRevenue, string EtcCount, string TransactionDate, string DateTransmitted);
+
+    // Straight from the 5680 query. @STDate/@ENDDate replace the script's DECLARE/SELECT
+    // (@ENDDate is exclusive, as in the script). The Eastern window is converted to UTC
+    // in SQL exactly as the script does.
+    private const string TransmitSummarySql = """
+        SET NOCOUNT ON;
+
+        DECLARE @STDate_UTC  datetime = CAST(@STDate  AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+        DECLARE @ENDDate_UTC datetime = CAST(@ENDDate AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+
+        WITH base AS (
+            SELECT
+                -- truncate to the hour in UTC first; AT TIME ZONE then runs per hour bucket, not per row
+                DATEADD(HOUR, DATEDIFF(HOUR, 0, ubd.UTCDateTransmitted), 0) AS SentHourUTC,
+                DATEADD(HOUR, DATEDIFF(HOUR, 0, trv.TransDate), 0)          AS TransHourUTC,
+                trv.OrgID, trv.TransType, ur.PlazaID, ur.IndicatedRevenueOrig
+            FROM ICD.dbo.tblUFMBatchDetail  ubd WITH (NOLOCK)
+            JOIN ICD.dbo.tblCoopTagTollUsage trv WITH (NOLOCK) ON trv.TransID = ubd.UFMID
+            LEFT JOIN ICD.dbo.tblUFMRecord   ur  WITH (NOLOCK) ON ur.UFMID   = ubd.UFMID
+            WHERE ubd.UTCDateTransmitted >= @STDate_UTC
+              AND ubd.UTCDateTransmitted <  @ENDDate_UTC
+              AND ubd.DispCode = 'SUC'
+              AND trv.TransType = 'ETCX'         -- filter early
+        ),
+        hourly AS (                                           -- shrink to a few hundred rows
+            SELECT SentHourUTC, TransHourUTC, OrgID, PlazaID,
+                   SUM(ISNULL(IndicatedRevenueOrig,0)) AS EtcRev,
+                   COUNT(1)                            AS EtcCnt
+            FROM base
+            GROUP BY SentHourUTC, TransHourUTC, OrgID, PlazaID
+        ),
+        local AS (                                            -- time-zone conversion on the small set only
+            SELECT h.*,
+                   CAST(SentHourUTC  AT TIME ZONE 'UTC' AT TIME ZONE 'Eastern Standard Time' AS date) AS SentDate,
+                   CAST(TransHourUTC AS date) AS TransDateLocal   -- TransDate is already local time: no conversion
+            FROM hourly h
+        )
+        SELECT o.OrgName, '' AS textbox47_ignore, '' AS Roadway_Gantry, l.PlazaID,
+               FORMAT(ISNULL(SUM(EtcRev),0),  'C',  'en-US') AS ETC_Revenue,
+               FORMAT(SUM(EtcCnt),            'N0', 'en-US') AS ETC_Count,
+               CONVERT(varchar(10), TransDateLocal, 101) AS TransactionDate,
+               CONVERT(varchar(10), SentDate,       101) AS DateTransmitted
+        FROM local l
+        JOIN CPC.dbo.tblOrg o WITH (NOLOCK) ON o.OrgID = l.OrgID
+        GROUP BY SentDate, TransDateLocal, l.PlazaID, o.OrgName
+        ORDER BY SentDate, l.PlazaID, TransDateLocal          -- sort on real dates, not strings
+        OPTION (RECOMPILE);                                   -- lets the optimizer see the variable values
+        """;
+
+    private static async Task<object> FetchTransmitSummaryRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = TransmitSummarySql;
+        command.CommandTimeout = Math.Max(settings.CommandTimeoutSeconds, 7200);
+
+        command.Parameters.Add(new SqlParameter("@STDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        // The script's end date is exclusive; the program's end date is inclusive.
+        command.Parameters.Add(new SqlParameter("@ENDDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date.AddDays(1) });
+
+        var rows = new List<TransmitSummaryRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            if (reader.FieldCount != 8)
+                continue;
+
+            string Text(int ordinal) => reader.IsDBNull(ordinal) ? "" : Convert.ToString(reader.GetValue(ordinal), CultureInfo.InvariantCulture) ?? "";
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new TransmitSummaryRow(
+                    OrgName: Text(0), Placeholder1: Text(1), Placeholder2: Text(2), PlazaId: Text(3),
+                    EtcRevenue: Text(4), EtcCount: Text(5),
+                    TransactionDate: Text(6), DateTransmitted: Text(7)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write5680Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<TransmitSummaryRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            // All values are already the text the query formats ("$4,218.39", "12,600"), and
+            // PlazaID is an identifier -- so they are written as strings, quoted only when they
+            // contain a comma.
+            object?[] fields =
+            [
+                row.OrgName, row.Placeholder1, row.Placeholder2, row.PlazaId,
+                row.EtcRevenue, row.EtcCount,
+                row.TransactionDate, row.DateTransmitted
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    // ---- 6192: violation categories, raw SQL ----
+
+    private sealed record ViolationCategoryRow(string? RoadWay, string Category, string SecondaryCodes, long Count, double Amount);
+
+    // Straight from 6192_20261008.sql. @STDATE/@ENDDATE replace the script's DECLAREs
+    // (@ENDDATE is exclusive, as in the script). Temp tables are dropped up front so the
+    // batch is safe to run again on the same connection.
+    private const string ViolationCategorySql = """
+        SET NOCOUNT ON;
+
+        IF OBJECT_ID(N'tempdb..#TMP_PRE', N'U') IS NOT NULL DROP TABLE #TMP_PRE;
+        IF OBJECT_ID(N'tempdb..#TMP_PACK', N'U') IS NOT NULL DROP TABLE #TMP_PACK;
+        IF OBJECT_ID(N'tempdb..#TMP_GANTRY_CONV', N'U') IS NOT NULL DROP TABLE #TMP_GANTRY_CONV;
+
+        CREATE TABLE #TMP_PACK
+        (
+            id bigint not null identity(1,1)
+            ,RoadWay varchar(50) null
+            ,Category varchar(512) null
+            ,TripSecondaryCode_Joined varchar(512) null
+            ,TotalCount bigint null
+            ,TotalAmount float null
+        );
+
+        CREATE TABLE #TMP_GANTRY_CONV
+        (
+            id int not null identity(1,1)
+            ,RoadWay varchar(50) not null
+            ,OrgID varchar(50) not null
+        );
+
+        INSERT INTO #TMP_GANTRY_CONV (RoadWay, OrgID) VALUES
+        ('SR112',50),('836-17',55),('836-57',60),('836-97',65),('SR874',80),('SR878',75),('SR924',70);
+
+        SELECT
+            cttu.[TransID]
+            ,cttu.[OrgID]
+            ,tgv.RoadWay
+            ,[TollType]
+            ,[TransDate]
+            ,[LaneNumber]
+            ,[Fare]
+            ,[FullToll]
+            ,[ChargeToll]
+            ,[CollectedToll]
+            ,[AVCClass]
+            ,[AxlesExpected]
+            ,[AxlesCounted]
+            ,[TagStatusID]
+            ,[AgencyVehicleClass]
+            ,[RateTableID]
+            ,[SendToICD]
+            ,amd.AmendmentType
+            ,amd.AmendmentTRIPMappingID
+            ,atm.TRIPSource
+            ,atm.TRIPSourceRule
+            ,atm.TRIPPrimaryCode
+            ,atm.TRIPSecondaryCode
+            ,uai.UFMAmendmentTypeID
+            ,uat.AmendmentType UAT_AmendmentType
+        INTO #TMP_PRE
+        FROM [ICD].[dbo].[tblCoopTagTollUsage] (nolock) cttu
+        LEFT OUTER JOIN [ICD].[dbo].[tblAmendments] (nolock) amd
+            ON cttu.TransID = amd.TransID
+            and Source = 'TRIPAmendmentService'
+        LEFT OUTER JOIN [ICD].[dbo].[tblAmendmentTRIPMapping] (nolock) atm
+            ON amd.AmendmentTRIPMappingID = atm.ID
+        LEFT OUTER JOIN
+        (
+            SELECT uai1.*
+            FROM [ICD].[dbo].[tblUFMAmendmentInfo] (nolock) uai1
+            INNER JOIN
+            (
+                SELECT UFMID, MAX(uai2.SettlementPostingTime) spt
+                FROM [ICD].[dbo].[tblUFMAmendmentInfo] (nolock) uai2
+                GROUP BY UFMID
+            ) uai3
+            ON uai1.UFMID = uai3.UFMID and uai1.SettlementPostingTime = uai3.spt
+        ) uai
+            ON cttu.TransID = uai.UFMID
+        LEFT OUTER JOIN [ICD].[dbo].[tblUFMAmendmentType] (nolock) uat
+            ON uai.AccountTypeID = uat.AmendmentTypeID
+        LEFT OUTER JOIN #TMP_GANTRY_CONV tgv
+            ON cttu.OrgID = tgv.OrgID
+        WHERE TransDate >= @STDATE
+          AND TransDate < @ENDDATE
+          AND [TransType] = 'VIOL';
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, TRIPPrimaryCode, STRING_AGG(TRIPSecondaryCode,','), SUM(CountX) TotalCount, Sum(AmountX) TotalAmount
+        FROM
+        (
+            SELECT RoadWay
+                ,'CLOSED - EIP disposition code 6, reason code 0100' TRIPPrimaryCode
+                ,TRIPSecondaryCode
+                ,Count(TransID) CountX
+                ,Sum(FullToll) AmountX
+            FROM #TMP_PRE
+            WHERE TRIPSource ='MIRREJ' AND
+                  TRIPSourceRule = 'REVIEW_CODE_OFF' AND
+                  TRIPPrimaryCode = 'Recurrent Plate-Visibility'
+            GROUP BY RoadWay, TRIPSecondaryCode
+        ) a
+        GROUP By RoadWay, TRIPPrimaryCode;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, TRIPPrimaryCode, STRING_AGG(TRIPSecondaryCode,','), SUM(CountX) TotalCount, Sum(AmountX) TotalAmount
+        FROM
+        (
+            SELECT RoadWay
+                ,'CLOSED - EIP disposition code 6, reason code 0300' TRIPPrimaryCode
+                ,TRIPSecondaryCode
+                ,Count(TransID) CountX
+                ,Sum(FullToll) AmountX
+            FROM #TMP_PRE
+            WHERE TRIPSource ='MIRREJ' AND
+                  TRIPSourceRule = 'REVIEW_CODE_OFF' AND
+                  TRIPPrimaryCode = 'Camera Imaging Problem'
+            GROUP BY RoadWay, TRIPPrimaryCode, TRIPSecondaryCode
+        ) b
+        GROUP BY RoadWay, TRIPPrimaryCode;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, TRIPPrimaryCode, STRING_AGG(TRIPSecondaryCode,','), SUM(CountX) TotalCount, Sum(AmountX) TotalAmount
+        FROM
+        (
+            SELECT RoadWay
+                ,'WF - UFM Pending' TRIPPrimaryCode
+                ,TRIPSecondaryCode
+                ,Count(TransID) CountX
+                ,Sum(FullToll) AmountX
+            FROM #TMP_PRE
+            WHERE (TRIPSource ='MIRIDENT' AND TRIPSourceRule = 'REVIEW_IMPROVED') OR
+                  (TRIPSource ='AIPIDENT' AND TRIPSourceRule = 'REVIEW')
+            GROUP BY RoadWay, TRIPPrimaryCode, TRIPSecondaryCode
+        ) c
+        GROUP BY RoadWay, TRIPPrimaryCode;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, 'WF - UH video transaction created', '', Count(TransID), Sum(FullToll) AmountX
+        FROM #TMP_PRE
+        WHERE IsNULL(TRIPSource,'-') ='-' AND IsNULL(TRIPSourceRule,'-') = '-'
+        GROUP BY RoadWay;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, 'CLOSED - EIP disposition code 7, black list', '', Count(TransID), Sum(FullToll) AmountX
+        FROM #TMP_PRE
+        WHERE TRIPSource ='LPNLISTREJ' AND TRIPSourceRule ='LPNBLKLIST'
+        GROUP BY RoadWay;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, 'CLOSED - EIP disposition code 6, reason code 0500', '', Count(TransID), Sum(FullToll) AmountX
+        FROM #TMP_PRE
+        WHERE TRIPSource ='MIRREJ' AND
+              TRIPSourceRule ='REVIEW_CODE_OFF' AND
+              TRIPPrimaryCode ='Other' AND
+              TRIPSecondaryCode ='Emergency Vehicle'
+        GROUP BY RoadWay;
+
+        INSERT INTO #TMP_PACK (RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount)
+        SELECT RoadWay, 'CLOSED - EIP disposition code 6, no answer', '', Count(TransID), Sum(FullToll) AmountX
+        FROM #TMP_PRE
+        WHERE TRIPSource ='MIRREJ' AND
+              TRIPSourceRule ='REVIEW_CODE_OFF' AND
+              TRIPPrimaryCode ='Other' AND
+              TRIPSecondaryCode ='Other'
+        GROUP BY RoadWay;
+
+        SELECT RoadWay, Category, TripSecondaryCode_Joined, TotalCount, TotalAmount
+        FROM #TMP_PACK
+        ORDER BY RoadWay, Category, TripSecondaryCode_Joined;
+        """;
+
+    private static async Task<object> FetchViolationCategoryRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = ViolationCategorySql;
+        // The script scans the whole UFM amendment table and takes minutes even for one
+        // day, so it gets a much longer timeout than the 10-minute default.
+        command.CommandTimeout = Math.Max(settings.CommandTimeoutSeconds, 7200);
+
+        command.Parameters.Add(new SqlParameter("@STDATE", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        // The script's end date is exclusive; the program's end date is inclusive.
+        command.Parameters.Add(new SqlParameter("@ENDDATE", System.Data.SqlDbType.Date) { Value = chunkEnd.Date.AddDays(1) });
+
+        var rows = new List<ViolationCategoryRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            if (reader.FieldCount != 5)
+                continue;
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new ViolationCategoryRow(
+                    RoadWay: reader.IsDBNull(0) ? null : reader.GetString(0),
+                    Category: reader.IsDBNull(1) ? "" : reader.GetString(1),
+                    SecondaryCodes: reader.IsDBNull(2) ? "" : reader.GetString(2),
+                    Count: reader.IsDBNull(3) ? 0 : reader.GetInt64(3),
+                    Amount: reader.IsDBNull(4) ? 0d : reader.GetDouble(4)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write6192Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<ViolationCategoryRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            object?[] fields =
+            [
+                row.RoadWay,
+                row.Category,
+                row.SecondaryCodes,
+                row.Count,
+                FormatCurrency((decimal)Math.Round(row.Amount, 2))
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    // ---- 5625: [dbo].[uspr_csc_OTOFileDetails_sql_Sarad_Migration], one CSV line per transaction ----
+
+    private static async Task<object> FetchOtoDetailRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandType = System.Data.CommandType.StoredProcedure;
+        command.CommandText = procedureName;
+        command.CommandTimeout = settings.CommandTimeoutSeconds;
+
+        command.Parameters.Add(new SqlParameter("@inStartDate", System.Data.SqlDbType.DateTime) { Value = chunkStart.Date });
+        command.Parameters.Add(new SqlParameter("@inEndDate", System.Data.SqlDbType.DateTime) { Value = chunkEnd.Date });
+        command.Parameters.Add(new SqlParameter("@inReportType", System.Data.SqlDbType.TinyInt) { Value = (byte)1 });
+        command.Parameters.Add(new SqlParameter("@inOrgID", System.Data.SqlDbType.BigInt) { Value = 0L });
+        command.Parameters.Add(new SqlParameter("@inGroupBy", System.Data.SqlDbType.TinyInt) { Value = (byte)1 });
+
+        // Each row is formatted to its final CSV line while streaming, so only one string
+        // per transaction is kept. The procedure already returns plaza/lane order.
+        var lines = new List<string>();
+        var line = new StringBuilder(160);
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            var plaza = reader.GetOrdinal("PlazaCode");
+            var lane = reader.GetOrdinal("LaneNumber");
+            var collector = reader.GetOrdinal("TollCollector");
+            var laneExit = reader.GetOrdinal("LaneExitDate");
+            var transponder = reader.GetOrdinal("TransponderID");
+            var agency = reader.GetOrdinal("Agency");
+            var state = reader.GetOrdinal("State");
+            var collected = reader.GetOrdinal("CollectedAmt");
+            var charged = reader.GetOrdinal("ChargedAmt");
+            var full = reader.GetOrdinal("FullAmt");
+            var lowBattery = reader.GetOrdinal("LowBattery");
+            var status = reader.GetOrdinal("TransponderStatus");
+            var lowBalance = reader.GetOrdinal("LowBalance");
+            var insufficient = reader.GetOrdinal("InsufficentFunds");
+            var creditNum = reader.GetOrdinal("CreditListNum");
+            var creditUpdated = reader.GetOrdinal("CreditListUpdated");
+            var avc = reader.GetOrdinal("AVCClass");
+            var transponderClass = reader.GetOrdinal("TransponderClass");
+            var revenueType = reader.GetOrdinal("RevenueType");
+            var violation = reader.GetOrdinal("ViolationCode");
+            var readerConfirmation = reader.GetOrdinal("ReaderConfirmation");
+            var amtech = reader.GetOrdinal("AmtechTransponderNumber");
+            var speed = reader.GetOrdinal("VehicleSpeed");
+            var reject = reader.GetOrdinal("RejectReasonCode");
+
+            string Text(int ordinal) => reader.IsDBNull(ordinal) ? "" : reader.GetString(ordinal).TrimEnd();
+
+            while (await reader.ReadAsync())
+            {
+                line.Clear();
+                // LaneType (S), SignedBalance (+00000) and AntiPassbackCode (02) are
+                // constants in the legacy report; the procedure hardcodes 0 / 000000 / 00.
+                AppendCsv(line, Text(plaza), first: true);
+                AppendCsv(line, Text(lane));
+                AppendCsv(line, "S");
+                AppendCsv(line, Text(collector));
+                AppendCsv(line, Text(laneExit));
+                AppendCsv(line, Text(transponder));
+                AppendCsv(line, Text(agency));
+                AppendCsv(line, Text(state));
+                AppendCsv(line, "+00000");
+                AppendCsv(line, FormatDollars(Text(collected)));
+                AppendCsv(line, FormatDollars(Text(charged)));
+                AppendCsv(line, FormatDollars(Text(full)));
+                AppendCsv(line, Text(lowBattery));
+                AppendCsv(line, Text(status));
+                AppendCsv(line, Text(lowBalance));
+                AppendCsv(line, Text(insufficient));
+                AppendCsv(line, Text(creditNum));
+                AppendCsv(line, Text(creditUpdated));
+                AppendCsv(line, "02");
+                AppendCsv(line, Text(avc));
+                AppendCsv(line, Text(transponderClass));
+                AppendCsv(line, Text(revenueType));
+                AppendCsv(line, Text(violation));
+                AppendCsv(line, Text(readerConfirmation));
+                AppendCsv(line, Text(amtech));
+                AppendCsv(line, Text(speed));
+                AppendCsv(line, Text(reject));
+                lines.Add(line.ToString());
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return lines;
+    }
+
+    // "0033" (cents, zero padded) -> "$0.33"
+    private static string FormatDollars(string cents) =>
+        "$" + (long.Parse(cents, CultureInfo.InvariantCulture) / 100m).ToString("#,##0.00", CultureInfo.InvariantCulture);
+
+    private static void AppendCsv(StringBuilder sb, string text, bool first = false)
+    {
+        if (!first)
+            sb.Append(',');
+
+        if (text.IndexOfAny(new[] { ',', '"', '\r', '\n' }) >= 0)
+            sb.Append('"').Append(text.Replace("\"", "\"\"")).Append('"');
+        else
+            sb.Append(text);
+    }
+
+    private static long Write5625Rows(object rowsObj, StreamWriter writer)
+    {
+        var lines = (IReadOnlyList<string>)rowsObj;
+        foreach (var line in lines)
+        {
+            writer.Write(line);
+            writer.Write("\r\n");
+        }
+
+        return lines.Count;
+    }
+
     // ---- 1220: [RPrl].[uspr_trn_CPC_TransactionDetails_withETCNum], straight passthrough ----
 
     private static async Task<object> FetchTransactionRowsAsync(
@@ -1118,13 +1631,14 @@ internal static class Program
             ? value.ToString("#,##0", CultureInfo.InvariantCulture)
             : value.ToString(CultureInfo.InvariantCulture);
 
-    private static IEnumerable<(DateTime Start, DateTime End)> SplitIntoWeeklyChunks(DateTime startDate, DateTime endDate)
+    private static IEnumerable<(DateTime Start, DateTime End)> SplitIntoWeeklyChunks(
+        DateTime startDate, DateTime endDate, int chunkDays = MaxDaysPerCall)
     {
         var chunkStart = startDate.Date;
         var end = endDate.Date;
         while (chunkStart <= end)
         {
-            var chunkEnd = chunkStart.AddDays(MaxDaysPerCall - 1);
+            var chunkEnd = chunkStart.AddDays(chunkDays - 1);
             if (chunkEnd > end)
                 chunkEnd = end;
 
