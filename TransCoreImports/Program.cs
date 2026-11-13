@@ -186,6 +186,17 @@ internal static class Program
             WriteRows: Write5680Rows,
             ChunkDays: 3660),
 
+        // Raw SQL (5678 export, SQL_TEST/5678_export.sql): one summary row with ETCX and VIOL
+        // transaction counts and indicated revenue for the requested Eastern-time window
+        // (successfully transmitted records). The whole range is one aggregate, so it goes to SQL in
+        // one call and yields one row. The name here is just a display label, not a real SQL object.
+        ["5678"] = new ImportTypeConfig(
+            ProcedureName: "[raw-sql].[5678-Export]",
+            HeaderRow: "Total_UFMID_ETCX_Count,Total_IndicatedRevenueOrig_ETCX,Total_UFMID_VIOL_Count,Total_IndicatedRevenueOrig_VIOL",
+            Fetch: FetchTotalsSummaryRowsAsync,
+            WriteRows: Write5678Rows,
+            ChunkDays: 3660),
+
         // Same source rows as 1310 (shares its procedure, one SP call covers both),
         // but drops Date/Hour (columns C/D) in favor of a LaneNumber column, and
         // sums across every date/hour in the whole requested range per lane --
@@ -858,6 +869,88 @@ internal static class Program
             object?[] fields =
             [
                 row.DateTransmitted, row.TransactionDate, row.PlazaId, row.TransactionCount, row.IndicatedRevenue
+            ];
+
+            WriteCsvLine(writer, fields);
+        }
+
+        return rows.Count;
+    }
+
+    // ---- 5678: ETC / VIOL totals for the window, one summary row, raw SQL ----
+
+    private sealed record TotalsSummaryRow(long EtcCount, decimal EtcRevenue, long ViolCount, decimal ViolRevenue);
+
+    // @STDate/@ENDDate are the Eastern days (@ENDDate exclusive); the Eastern window is converted to UTC
+    // in SQL with the Windows time zone, so it is correct year-round (no hard-coded UTC offset).
+    private const string TotalsSummarySql = """
+        SET NOCOUNT ON;
+
+        DECLARE @STDate_UTC  datetime = CAST(@STDate  AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+        DECLARE @ENDDate_UTC datetime = CAST(@ENDDate AS datetime2) AT TIME ZONE 'Eastern Standard Time' AT TIME ZONE 'UTC';
+
+        SELECT
+            COUNT(CASE WHEN trv.TransType = 'ETCX' THEN ubd.UFMID END) AS Total_UFMID_ETCX_Count,
+            SUM(CASE WHEN trv.TransType = 'ETCX' THEN ur.IndicatedRevenueOrig ELSE 0 END) AS Total_IndicatedRevenueOrig_ETCX,
+            COUNT(CASE WHEN trv.TransType = 'VIOL' THEN ubd.UFMID END) AS Total_UFMID_VIOL_Count,
+            SUM(CASE WHEN trv.TransType = 'VIOL' THEN ur.IndicatedRevenueOrig ELSE 0 END) AS Total_IndicatedRevenueOrig_VIOL
+        FROM [ICD].[dbo].[tblUFMBatchDetail] ubd WITH (NOLOCK)
+        INNER JOIN [ICD].[dbo].[tblCoopTagTollUsage] trv WITH (NOLOCK) ON ubd.UFMID = trv.TransID
+        LEFT OUTER JOIN [ICD].[dbo].[tblUFMRecord] ur WITH (NOLOCK) ON ubd.UFMID = ur.UFMID
+        WHERE ubd.UTCDateTransmitted >= @STDate_UTC
+          AND ubd.UTCDateTransmitted <  @ENDDate_UTC
+          AND ubd.DispCode = 'SUC'
+          AND trv.TransType IN ('VIOL', 'ETCX')
+        OPTION (RECOMPILE);   -- lets the optimizer see the date variables (without it the plan is far slower)
+        """;
+
+    private static async Task<object> FetchTotalsSummaryRowsAsync(
+        SqlConnection connection,
+        SqlSettings settings,
+        string procedureName,
+        DateTime chunkStart,
+        DateTime chunkEnd)
+    {
+        await using var command = connection.CreateCommand();
+        command.CommandText = TotalsSummarySql;
+        command.CommandTimeout = Math.Max(settings.CommandTimeoutSeconds, 7200);
+
+        command.Parameters.Add(new SqlParameter("@STDate", System.Data.SqlDbType.Date) { Value = chunkStart.Date });
+        // The query's end date is exclusive; the program's end date is inclusive.
+        command.Parameters.Add(new SqlParameter("@ENDDate", System.Data.SqlDbType.Date) { Value = chunkEnd.Date.AddDays(1) });
+
+        var rows = new List<TotalsSummaryRow>();
+
+        await using var reader = await command.ExecuteReaderAsync();
+        do
+        {
+            if (reader.FieldCount != 4)
+                continue;
+
+            while (await reader.ReadAsync())
+            {
+                rows.Add(new TotalsSummaryRow(
+                    EtcCount: reader.IsDBNull(0) ? 0 : Convert.ToInt64(reader.GetValue(0), CultureInfo.InvariantCulture),
+                    EtcRevenue: reader.IsDBNull(1) ? 0m : Convert.ToDecimal(reader.GetValue(1), CultureInfo.InvariantCulture),
+                    ViolCount: reader.IsDBNull(2) ? 0 : Convert.ToInt64(reader.GetValue(2), CultureInfo.InvariantCulture),
+                    ViolRevenue: reader.IsDBNull(3) ? 0m : Convert.ToDecimal(reader.GetValue(3), CultureInfo.InvariantCulture)));
+            }
+        }
+        while (await reader.NextResultAsync());
+
+        return rows;
+    }
+
+    private static long Write5678Rows(object rowsObj, StreamWriter writer)
+    {
+        var rows = (IReadOnlyList<TotalsSummaryRow>)rowsObj;
+        foreach (var row in rows)
+        {
+            // Counts get the usual thousands separator; revenue is plain 2-decimal text with grouping.
+            object?[] fields =
+            [
+                row.EtcCount, FormatCurrency(row.EtcRevenue),
+                row.ViolCount, FormatCurrency(row.ViolRevenue)
             ];
 
             WriteCsvLine(writer, fields);
