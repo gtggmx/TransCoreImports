@@ -197,12 +197,12 @@ internal static class Program
             WriteRows: Write5678Rows,
             ChunkDays: 3660),
 
-        // Raw SQL (5678_V1, SQL_TEST/5678_V1_export.sql): violation count and indicated revenue per
+        // Raw SQL (5678_V1, SQL_TEST/5678_V1_export.sql): ETCX count and indicated revenue per
         // transmit date and transaction date (no plaza). Same optimized hourly-bucket form as 5695.
         // The grouping spans the whole range, so the range goes to SQL in one call. The name here is
         // just a display label, not a real SQL object.
         ["5678_V1"] = new ImportTypeConfig(
-            ProcedureName: "[raw-sql].[5678_V1-ViolationsByDate]",
+            ProcedureName: "[raw-sql].[5678_V1-EtcByDate]",
             HeaderRow: "DateTransmitted,TransactionDate,TransactionCount,IndicatedRevenueOrig",
             Fetch: FetchViolByDateRowsAsync,
             WriteRows: Write5678V1Rows,
@@ -970,11 +970,11 @@ internal static class Program
         return rows.Count;
     }
 
-    // ---- 5678_V1: violations by transmit date / transaction date, raw SQL ----
+    // ---- 5678_V1: ETC by transmit date / transaction date, raw SQL ----
 
     private sealed record ViolByDateRow(string DateTransmitted, string TransactionDate, string TransactionCount, string IndicatedRevenue);
 
-    // Same query as 5695 without the plaza column. @STDate/@ENDDate are the Eastern days (@ENDDate
+    // Same shape as 5695 (without the plaza column) but for ETCX records instead of violations. @STDate/@ENDDate are the Eastern days (@ENDDate
     // exclusive); the window is converted to UTC in SQL with the Windows time zone. TransDate is
     // already local time, so only the transmit time is converted.
     private const string ViolByDateSql = """
@@ -995,7 +995,7 @@ internal static class Program
             WHERE ubd.UTCDateTransmitted >= @STDate_UTC
               AND ubd.UTCDateTransmitted <  @ENDDate_UTC
               AND ubd.DispCode = 'SUC'
-              AND trv.TransType = 'VIOL'
+              AND trv.TransType = 'ETCX'
         ),
         hourly AS (
             SELECT SentHourUTC, TransDay, OrgID,
